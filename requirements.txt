@@ -1,0 +1,3 @@
+# Parad0x Command standalone runtime is mostly stdlib.
+# Add optional platform helpers here later if this becomes its own repo.
+pytest>=8.0.0

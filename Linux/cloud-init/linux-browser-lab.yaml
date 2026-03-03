@@ -1,0 +1,28 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - curl
+  - dbus-x11
+  - firefox
+  - git
+  - novnc
+  - python3-venv
+  - tigervnc-standalone-server
+  - tigervnc-tools
+  - websockify
+  - xfce4
+  - xfce4-goodies
+  - xterm
+runcmd:
+  - mkdir -p /home/ubuntu/.vnc
+  - |
+    cat >/home/ubuntu/.vnc/xstartup <<'EOF'
+    #!/bin/sh
+    unset SESSION_MANAGER
+    unset DBUS_SESSION_BUS_ADDRESS
+    xrdb "$HOME/.Xresources"
+    startxfce4 &
+    EOF
+  - chmod +x /home/ubuntu/.vnc/xstartup
+  - chown -R ubuntu:ubuntu /home/ubuntu/.vnc

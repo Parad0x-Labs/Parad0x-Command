@@ -1,0 +1,27 @@
+.DS_Store
+Thumbs.db
+*.swp
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+.codex_backups/
+.state/
+Linux/.state/
+
+*.log
+*.zip
+*.failover
+*.production
+*.windows_failover
+
+.parad0x_command.env
+.parad0x_command.env.ps1
+launch_parad0x_command.sh
+launch_parad0x_command.ps1
+run_parad0x_command_server.ps1
+Parad0x Command.cmd
+Parad0x Command.command
+Parad0x Command.desktop
