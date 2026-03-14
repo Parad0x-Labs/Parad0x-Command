@@ -9,7 +9,7 @@ echo "Stopping existing Parad0x Command instance in the Linux VM..."
 "$ROOT_DIR/scripts/linux-vm-stop-parad0x-command.sh" >/dev/null 2>&1 || true
 sleep 1
 
-REMOTE_CMD="cd $VM_PROJECT_DIR && setsid env PORT=$(printf %q "$PORT") bash ./run_parad0x_command_export.sh >/tmp/parad0x-command-linux.log 2>&1 </dev/null & pid=\$!; echo \$pid"
+REMOTE_CMD="cd $VM_PROJECT_DIR && setsid env PORT=$(printf %q "$PORT") DISPLAY=:1 XAUTHORITY=/home/ubuntu/.Xauthority bash ./run_parad0x_command_export.sh >/tmp/parad0x-command-linux.log 2>&1 </dev/null & pid=\$!; echo \$pid"
 
 echo "Starting Parad0x Command in the Linux VM..."
 PID=$(multipass exec linux-browser-lab -- bash -lc "$REMOTE_CMD")

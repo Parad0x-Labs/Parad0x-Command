@@ -7,7 +7,7 @@ VM_NAME=linux-browser-lab
 MOUNT_TARGET=/home/ubuntu/project
 
 if ! multipass info "$VM_NAME" >/dev/null 2>&1; then
-  multipass launch --name "$VM_NAME" --cpus 4 --memory 4G --disk 40G --cloud-init "$ROOT_DIR/cloud-init/linux-browser-lab.yaml"
+  multipass launch --name "$VM_NAME" --cpus 4 --memory 14G --disk 40G --cloud-init "$ROOT_DIR/cloud-init/linux-browser-lab.yaml"
 fi
 
 multipass start "$VM_NAME"

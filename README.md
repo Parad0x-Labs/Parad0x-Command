@@ -2,21 +2,19 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg) ![Mode: Local First](https://img.shields.io/badge/Mode-Local--First-0b0f1a) ![Access: 127.0.0.1](https://img.shields.io/badge/Access-127.0.0.1-blue) ![Platforms: macOS Windows Linux](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-111827)
 
-**Local-first desktop command surface for apps, processes, browser activity, files, agents, and system telemetry.**
-
-Parad0x Command runs on the same machine it observes and renders a live local graph for operational awareness. It is built for direct desktop use, not for remote hosting.
+Local-first desktop command center for apps, processes, browser activity, files, agents, and system telemetry.
 
 Owner: `Parad0x Labs`  
 Contributor: `@sls_0x`  
-License: [MIT](./LICENSE)
+License: `MIT` (see `LICENSE`)
 
-## Why Parad0x Command
+## What You Get
 
-- Live graph of apps, process families, helper subprocesses, files, agents, and hardware nodes.
-- Clickable inspector cards with multi-card comparison.
-- Local process controls and network cut or restore controls.
-- Browser visibility when the host platform exposes the required metadata.
-- No cloud dependency and no remote dashboard by default.
+- Live system graph with apps, processes, files, hardware, and browser activity.
+- `SYSTEM` view for operational control and `AI MAP` view for live agent activity.
+- Multiple draggable inspector cards for side-by-side comparison.
+- Local process controls and network cut/restore controls.
+- No cloud dependency; local-only by default.
 
 ## Quick Start
 
@@ -88,10 +86,23 @@ Native window mode:
 ./parad0x-command native . --workspace . --desktop --port 8774
 ```
 
-Windows note:
+## V2: AI MAP
 
-- `Start Parad0x Command on Windows.cmd` is the preferred launcher.
-- It self-elevates so network controls have the permissions they usually need.
+AI MAP turns the system view into a live agent activity map:
+
+- Agent nodes with orbiting task, token, process, and status signals.
+- Memory files glow when active or referenced.
+- Live edges pulse on recent activity.
+- Multiple inspector cards for comparison.
+- The AI MAP uses the same local data plane as SYSTEM, not a separate remote service.
+
+## SDK / Agent Integration
+
+Parad0x Command is local-first but still automation friendly:
+
+- Local HTTP API over `127.0.0.1` with per-run token auth.
+- JSON responses for system and AI activity snapshots.
+- For agent-facing usage, see `AGENTS.md`.
 
 ## Security Model
 

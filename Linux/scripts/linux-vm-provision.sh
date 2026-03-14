@@ -21,4 +21,5 @@ multipass exec "$VM_NAME" -- sudo bash /home/ubuntu/linux-vm-provision-remote.sh
 IP=$(multipass info "$VM_NAME" | awk '/IPv4/ {print $2; exit}')
 
 echo "VNC password: $VNC_PASSWORD"
-echo "Open: http://$IP:6080/vnc.html"
+echo "Open native VM window: vnc://$IP:5901"
+echo "Web fallback: http://$IP:6080/vnc.html"

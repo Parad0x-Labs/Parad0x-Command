@@ -19,6 +19,7 @@ from liquefy_desktop_viz import (
     _browser_key_from_process_name,
     _validate_local_api_request,
     _build_activity_feed,
+    _build_ai_map_activity_snapshot,
     _build_agent_ops_summary,
     _build_monitor_rows,
     _build_task_progress_summary,
@@ -29,6 +30,7 @@ from liquefy_desktop_viz import (
     _get_cpu_info,
     _get_browser_tabs,
     _browser_debug_ports_from_processes,
+    _build_memory_map,
     _get_process_children_map,
     _get_disk_info,
     _get_gpu_info,
@@ -56,8 +58,10 @@ from liquefy_desktop_viz import (
     _resolve_background_image,
     _render_galactic_html,
     _render_live_html,
+    _render_memory_map_html,
     _scan_directory,
     build_parser,
+    cmd_memory_map,
     cmd_render,
     cmd_scan,
 )
@@ -217,6 +221,98 @@ class TestRenderHTML:
         assert "test.py" in html  # file should appear in embedded JSON
 
 
+class TestMemoryMap:
+    def test_builds_markdown_reference_graph(self, tmp_path, monkeypatch):
+        (tmp_path / "SOUL.md").write_text("[[guide]]\n[heart](HEARTBEAT.md)\n")
+        (tmp_path / "guide.md").write_text("See [soul](SOUL.md)")
+        (tmp_path / "HEARTBEAT.md").write_text("steady")
+        monkeypatch.setattr(desktop_viz, "_discover_memory_jobs", lambda root, index: [])
+
+        graph = _build_memory_map(tmp_path, max_files=100, max_depth=4)
+        memory_nodes = [n for n in graph["nodes"] if n["kind"] == "memory"]
+        assert len(memory_nodes) == 3
+        assert graph["stats"]["total_references"] == 3
+
+        by_name = {n["file_name"]: n for n in memory_nodes}
+        assert by_name["guide.md"]["inbound_refs"] == 1
+        assert by_name["SOUL.md"]["inbound_refs"] == 1
+        assert by_name["HEARTBEAT.md"]["inbound_refs"] == 1
+
+    def test_builds_job_edges(self, tmp_path, monkeypatch):
+        memory = tmp_path / "SOUL.md"
+        memory.write_text("root memory")
+
+        def _fake_jobs(root, index):
+            memory_id = next(iter(index["id_by_path"].values()))
+            return [
+                {
+                    "id": "job_test",
+                    "label": "nightly-sync",
+                    "kind": "job",
+                    "job_source": "cron",
+                    "schedule": "0 * * * *",
+                    "command": "python sync.py SOUL.md",
+                    "agent_key": "codex",
+                    "agent_label": "Codex",
+                    "color": "#5eead4",
+                    "reads": [memory_id],
+                }
+            ]
+
+        monkeypatch.setattr(desktop_viz, "_discover_memory_jobs", _fake_jobs)
+        graph = _build_memory_map(tmp_path, max_files=100, max_depth=4)
+        job_nodes = [n for n in graph["nodes"] if n["kind"] == "job"]
+        job_edges = [e for e in graph["edges"] if e["kind"] == "job-read"]
+        assert len(job_nodes) == 1
+        assert len(job_edges) == 1
+        assert graph["stats"]["total_jobs"] == 1
+        assert graph["stats"]["job_edges"] == 1
+
+    def test_memory_map_html(self, tmp_path, monkeypatch):
+        (tmp_path / "memory.md").write_text("hello")
+        monkeypatch.setattr(desktop_viz, "_discover_memory_jobs", lambda root, index: [])
+        graph = _build_memory_map(tmp_path, max_files=100, max_depth=4)
+        html = _render_memory_map_html(
+            graph,
+            "Memory Test",
+            api_token="tok_test",
+            initial_activity={"timestamp": "2026-03-04T12:00:00Z", "processes": [], "task_progress": {}, "activity_feed": [], "threat": {}},
+        )
+        assert "<!doctype html>" in html
+        assert "AI Activity Map" in html
+        assert "memory.md" in html
+        assert 'const API_TOKEN = "tok_test"' in html
+        assert 'fetchJsonWithTimeout("/api/ai-map-activity", 7000)' in html
+        assert 'const initialActivity = {"timestamp": "2026-03-04T12:00:00Z", "processes": [], "task_progress": {}, "activity_feed": [], "threat": {}}' in html
+        assert "Active agents" in html
+        assert "Running jobs" in html
+        assert "Hot memories" in html
+        assert "buildAgentOrbitals" in html
+        assert "agent-orbital" in html
+        assert 'id="inspector-layer"' in html
+        assert 'data-inspector-drag=' in html
+        assert 'parad0x-ai-map-search' in html
+
+    def test_build_ai_map_activity_snapshot(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(desktop_viz, "_get_processes", lambda: [{"pid": 1, "name": "Codex", "cpu_pct": 12.0, "mem_pct": 3.0, "category": "agent", "_group": "codex"}])
+        monkeypatch.setattr(
+            desktop_viz,
+            "_load_history_guard_summary",
+            lambda workspace: {
+                "providers": [],
+                "active_provider": "calendar",
+                "last_action": {"type": "gate-action", "command": "codex run task", "ts": "2026-03-04T12:00:00Z"},
+                "risky_actions_24h": 0,
+                "alerts": [],
+            },
+        )
+        graph = {"stats": {"sensitive_count": 0, "agent_related_count": 1}}
+        snap = _build_ai_map_activity_snapshot(graph, tmp_path, cached_ai_usage={})
+        assert snap["processes"][0]["name"] == "Codex"
+        assert snap["task_progress"]["phase"] == "gate-action"
+        assert snap["activity_feed"][0]["label"] == "gate-action"
+
+
 class TestCommands:
     def test_scan_json(self, tmp_path, capsys):
         (tmp_path / "hello.py").write_text("print(1)")
@@ -239,6 +335,15 @@ class TestCommands:
     def test_scan_missing_dir(self, tmp_path, capsys):
         rc = cmd_scan(_ns(path=str(tmp_path / "nonexistent"), json=True))
         assert rc == 1
+
+    def test_memory_map_json(self, tmp_path, capsys, monkeypatch):
+        (tmp_path / "SOUL.md").write_text("hello")
+        monkeypatch.setattr(desktop_viz, "_discover_memory_jobs", lambda root, index: [])
+        rc = cmd_memory_map(_ns(path=str(tmp_path), json=True))
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"]
+        assert out["result"]["stats"]["total_memories"] == 1
 
 
 class TestSystemInfo:
@@ -275,6 +380,14 @@ class TestSystemInfo:
             assert "cpu_pct" in p
             assert "mem_pct" in p
             assert "category" in p
+
+
+class TestParser:
+    def test_has_memory_map_command(self):
+        parser = build_parser()
+        args = parser.parse_args(["memory-map", ".", "--json"])
+        assert args.subcmd == "memory-map"
+        assert args.json is True
 
 
 class TestSystemSnapshot:
@@ -351,6 +464,25 @@ class TestLiveHTML:
         assert "APPS" in html
         assert "groupX" in html
         assert "_appsGrouped" in html
+
+    def test_embeds_ai_map_switch_when_url_present(self, tmp_path):
+        (tmp_path / "memory.md").write_text("# memo\n")
+        graph = _scan_directory(tmp_path, max_files=10, max_depth=2)
+        snap = _gather_system_snapshot(tmp_path)
+        html = _render_live_html(
+            snap,
+            graph,
+            "Test",
+            api_token="tok_test",
+            memory_map_url="/memory-map-view?token=tok_test",
+        )
+        assert "SYSTEM" in html
+        assert "AI MAP" in html
+        assert 'const MEMORY_MAP_URL = "/memory-map-view?token=tok_test"' in html
+        assert "memory-map-shell" in html
+        assert "memory-map-frame" in html
+        assert "setMainView('ai-map')" in html
+        assert "loadMainView()" in html
         assert "orbitRadius" in html
         assert "homeX" in html
         assert "renderAgentOps" in html

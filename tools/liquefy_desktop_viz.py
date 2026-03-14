@@ -8,6 +8,7 @@ Commands:
     scan   <path>    Scan directory and generate graph JSON
     render <path>    Scan + generate interactive HTML visualization
     serve  <path>    Scan + render + launch local web server
+    memory-map <path> Markdown memory graph + scheduled job map (v2)
     live   <path>    Full system organism — hardware core, processes, agents,
                      files, all connected with live-updating flows and
                      hologram inspectors. The real deal.
@@ -20,12 +21,14 @@ import collections
 import configparser
 import csv
 import hashlib
+import html
 import http.server
 import mimetypes
 import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -187,6 +190,21 @@ AGENT_PATTERNS = [
 ]
 
 LOG_PATTERNS = [".log", "audit", "trace", "event", ".jsonl", ".ndjson"]
+
+MEMORY_AGENT_COLORS = [
+    "#5eead4", "#60a5fa", "#f59e0b", "#f472b6", "#a78bfa", "#34d399",
+    "#fb7185", "#22d3ee", "#f97316", "#c084fc", "#4ade80", "#38bdf8",
+]
+
+MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+PATH_MD_RE = re.compile(r"(?<![A-Za-z0-9_])((?:\.{1,2}/|~/|/)?[A-Za-z0-9][A-Za-z0-9._/\-]*\.md)\b", re.IGNORECASE)
+
+MACOS_LAUNCHD_DIRS = (
+    Path.home() / "Library" / "LaunchAgents",
+    Path("/Library/LaunchAgents"),
+    Path("/Library/LaunchDaemons"),
+)
 
 
 def _utc_now() -> str:
@@ -862,6 +880,7 @@ def _load_ai_usage_summary(workspace: Optional[Path]) -> Dict[str, Any]:
     month_spend = 0.0
     top_models: collections.Counter[str] = collections.Counter()
     top_sources: collections.Counter[str] = collections.Counter()
+    recent_today_events: List[Dict[str, Any]] = []
 
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
@@ -881,6 +900,20 @@ def _load_ai_usage_summary(workspace: Optional[Path]) -> Dict[str, Any]:
             output_today += outp
             total_today += total
             spend_today += cost
+            recent_today_events.append(
+                {
+                    "ts": ts.isoformat().replace("+00:00", "Z"),
+                    "model": model,
+                    "input_tokens": inp,
+                    "output_tokens": outp,
+                    "total_tokens": total,
+                    "cost_usd": round(cost, 6),
+                }
+            )
+
+    recent_today_events.sort(key=lambda row: str(row.get("ts") or ""), reverse=True)
+    last_event = recent_today_events[0] if recent_today_events else {}
+    peak_event = max(recent_today_events, key=lambda row: int(row.get("total_tokens", 0) or 0), default={})
 
     profile = _load_ai_billing_profile(workspace)
     billing_mode = str(profile.get("mode") or "").strip().lower()
@@ -954,6 +987,11 @@ def _load_ai_usage_summary(workspace: Optional[Path]) -> Dict[str, Any]:
         "month_cost_usd": round(month_spend, 6),
         "top_models": top_models.most_common(3),
         "top_sources": top_sources.most_common(3),
+        "recent_events": recent_today_events[:6],
+        "last_event_tokens": int(last_event.get("total_tokens", 0) or 0),
+        "last_event_model": str(last_event.get("model") or ""),
+        "peak_event_tokens": int(peak_event.get("total_tokens", 0) or 0),
+        "peak_event_model": str(peak_event.get("model") or ""),
     }
     provider_status = _load_provider_adapter_status(workspace, summary, profile)
     if isinstance(provider_status, dict) and provider_status:
@@ -1105,6 +1143,31 @@ def _build_activity_feed(history_summary: Dict[str, Any], monitor_rows: List[Dic
             "ts": "",
         })
     return items[:6]
+
+
+def _build_ai_map_activity_snapshot(
+    file_graph: Dict[str, Any],
+    workspace: Optional[Path],
+    cached_ai_usage: Optional[Dict[str, Any]] = None,
+    cached_net_type: str = "Disconnected",
+) -> Dict[str, Any]:
+    history_summary = _load_history_guard_summary(workspace)
+    processes = _get_processes()
+    ai_usage = _load_ai_usage_summary(workspace) if workspace else (cached_ai_usage or {})
+    if not ai_usage and cached_ai_usage:
+        ai_usage = cached_ai_usage
+    threat = _build_threat_summary(history_summary, file_graph, ai_usage or {}, workspace)
+    task_progress = _build_task_progress_summary(history_summary)
+    monitor_rows = _build_monitor_rows(processes, cached_net_type)
+    activity_feed = _build_activity_feed(history_summary, monitor_rows, threat)
+    return {
+        "timestamp": _utc_now(),
+        "processes": processes,
+        "task_progress": task_progress,
+        "activity_feed": activity_feed,
+        "threat": threat,
+        "ai_usage": ai_usage,
+    }
 
 
 def _build_monitor_rows(procs: List[Dict[str, Any]], net_type: str) -> List[Dict[str, Any]]:
@@ -1631,6 +1694,1896 @@ def _scan_directory(
             "agent_related_count": sum(1 for n in nodes if n.get("agent_related")),
         },
     }
+
+
+def _collect_markdown_files(root: Path, max_files: int = MAX_FILES, max_depth: int = MAX_DEPTH) -> List[Path]:
+    out: List[Path] = []
+    root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in sorted(dirnames) if d not in SKIP_DIRS and not d.startswith(".")]
+        depth = str(dirpath).count(os.sep) - str(root).count(os.sep)
+        if depth >= max_depth:
+            dirnames.clear()
+            continue
+        current_dir = Path(dirpath)
+        for fname in sorted(filenames):
+            if len(out) >= max_files:
+                return out
+            if not fname.lower().endswith(".md"):
+                continue
+            fpath = current_dir / fname
+            try:
+                if fpath.is_file():
+                    out.append(fpath.resolve())
+            except OSError:
+                continue
+    return out
+
+
+def _memory_agent_key(text: str, allow_fallback: bool = True) -> str:
+    raw = str(text or "").lower()
+    patterns = {
+        "codex": ["codex"],
+        "cursor": ["cursor"],
+        "claude": ["claude", "anthropic"],
+        "gpt": ["openai", "chatgpt", "gpt"],
+        "aider": ["aider"],
+        "assistant": ["assistant", "agent", "automation", "memory"],
+    }
+    for key, names in patterns.items():
+        if any(name in raw for name in names):
+            return key
+    if not allow_fallback:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return cleaned[:24] or "job"
+
+
+def _memory_agent_label(agent_key: str) -> str:
+    key = str(agent_key or "").strip()
+    if not key:
+        return "Job"
+    return " ".join(part.capitalize() for part in key.replace("_", "-").split("-") if part) or "Job"
+
+
+def _memory_agent_color(agent_key: str) -> str:
+    idx = int(hashlib.md5(str(agent_key or "job").encode("utf-8")).hexdigest(), 16) % len(MEMORY_AGENT_COLORS)
+    return MEMORY_AGENT_COLORS[idx]
+
+
+def _extract_memory_ref_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    seen: Set[str] = set()
+    for regex in (MD_LINK_RE, WIKILINK_RE, PATH_MD_RE):
+        for match in regex.finditer(str(text or "")):
+            token = (match.group(1) or "").strip()
+            if not token:
+                continue
+            if token.startswith(("http://", "https://", "mailto:", "#")):
+                continue
+            if token not in seen:
+                seen.add(token)
+                tokens.append(token)
+    return tokens
+
+
+def _build_memory_file_index(root: Path, markdown_files: List[Path]) -> Dict[str, Any]:
+    id_by_path: Dict[str, str] = {}
+    rel_by_id: Dict[str, str] = {}
+    ids_by_name: Dict[str, List[str]] = collections.defaultdict(list)
+    ids_by_stem: Dict[str, List[str]] = collections.defaultdict(list)
+    ids_by_rel: Dict[str, List[str]] = collections.defaultdict(list)
+    ids_by_rel_no_ext: Dict[str, List[str]] = collections.defaultdict(list)
+
+    for path in sorted(markdown_files):
+        node_id = "mem_" + hashlib.md5(str(path).encode("utf-8")).hexdigest()[:12]
+        id_by_path[str(path)] = node_id
+        rel = path.relative_to(root).as_posix()
+        rel_by_id[node_id] = rel
+        ids_by_name[path.name.lower()].append(node_id)
+        ids_by_stem[path.stem.lower()].append(node_id)
+        ids_by_rel[rel.lower()].append(node_id)
+        ids_by_rel_no_ext[rel[:-3].lower() if rel.lower().endswith(".md") else rel.lower()].append(node_id)
+
+    return {
+        "id_by_path": id_by_path,
+        "rel_by_id": rel_by_id,
+        "ids_by_name": ids_by_name,
+        "ids_by_stem": ids_by_stem,
+        "ids_by_rel": ids_by_rel,
+        "ids_by_rel_no_ext": ids_by_rel_no_ext,
+    }
+
+
+def _resolve_memory_ref_token(token: str, current_dir: Path, root: Path, index: Dict[str, Any]) -> Optional[str]:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    raw = raw.split("#", 1)[0].split("?", 1)[0].strip()
+    if not raw:
+        return None
+    normalized = raw.replace("\\", "/").strip()
+    if not normalized:
+        return None
+
+    candidate_paths: List[Path] = []
+    path_like = "/" in normalized or normalized.startswith((".", "~")) or normalized.lower().endswith(".md")
+    if path_like:
+        candidate = Path(normalized).expanduser()
+        if not candidate.is_absolute():
+            candidate_paths.append((current_dir / candidate).resolve())
+            candidate_paths.append((root / candidate).resolve())
+        else:
+            candidate_paths.append(candidate.resolve())
+        if not normalized.lower().endswith(".md"):
+            with_ext = normalized + ".md"
+            candidate_ext = Path(with_ext).expanduser()
+            if not candidate_ext.is_absolute():
+                candidate_paths.append((current_dir / candidate_ext).resolve())
+                candidate_paths.append((root / candidate_ext).resolve())
+            else:
+                candidate_paths.append(candidate_ext.resolve())
+
+    seen_paths: Set[str] = set()
+    for path in candidate_paths:
+        path_key = str(path)
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        node_id = index["id_by_path"].get(path_key)
+        if node_id:
+            return node_id
+
+    rel_key = normalized.lower().rstrip("/")
+    if rel_key in index["ids_by_rel"] and len(index["ids_by_rel"][rel_key]) == 1:
+        return index["ids_by_rel"][rel_key][0]
+    rel_no_ext = rel_key[:-3] if rel_key.endswith(".md") else rel_key
+    if rel_no_ext in index["ids_by_rel_no_ext"] and len(index["ids_by_rel_no_ext"][rel_no_ext]) == 1:
+        return index["ids_by_rel_no_ext"][rel_no_ext][0]
+
+    basename = Path(normalized).name.lower()
+    stem = Path(normalized).stem.lower()
+    if basename.endswith(".md") and basename in index["ids_by_name"] and len(index["ids_by_name"][basename]) == 1:
+        return index["ids_by_name"][basename][0]
+    if stem in index["ids_by_stem"] and len(index["ids_by_stem"][stem]) == 1:
+        return index["ids_by_stem"][stem][0]
+    return None
+
+
+def _flatten_job_strings(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        out: List[str] = []
+        for item in value:
+            out.extend(_flatten_job_strings(item))
+        return out
+    if isinstance(value, dict):
+        out: List[str] = []
+        for key, item in value.items():
+            out.extend(_flatten_job_strings(key))
+            out.extend(_flatten_job_strings(item))
+        return out
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    return []
+
+
+def _job_memory_refs(text_chunks: List[str], current_dir: Path, root: Path, index: Dict[str, Any]) -> List[str]:
+    refs: List[str] = []
+    seen: Set[str] = set()
+    for chunk in text_chunks:
+        for token in _extract_memory_ref_tokens(chunk):
+            node_id = _resolve_memory_ref_token(token, current_dir, root, index)
+            if node_id and node_id not in seen:
+                seen.add(node_id)
+                refs.append(node_id)
+    return refs
+
+
+def _build_linux_cron_jobs(root: Path, index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = _run_cmd(["crontab", "-l"], default="")
+    if not raw or "no crontab" in raw.lower():
+        return []
+
+    jobs: List[Dict[str, Any]] = []
+    for idx, line in enumerate(raw.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        schedule = ""
+        command = ""
+        if stripped.startswith("@"):
+            parts = stripped.split(None, 1)
+            if len(parts) == 2:
+                schedule, command = parts
+        else:
+            parts = stripped.split(None, 5)
+            if len(parts) >= 6:
+                schedule = " ".join(parts[:5])
+                command = parts[5]
+        if not command:
+            continue
+        refs = _job_memory_refs([command], root, root, index)
+        if not refs:
+            continue
+        label = command.split("/")[-1].split()[0][:42] or f"cron {idx}"
+        agent_key = _memory_agent_key(command)
+        jobs.append(
+            {
+                "id": "job_" + hashlib.md5(f"cron:{idx}:{command}".encode("utf-8")).hexdigest()[:12],
+                "label": label,
+                "kind": "job",
+                "job_source": "cron",
+                "schedule": schedule or "cron",
+                "command": command,
+                "agent_key": agent_key,
+                "agent_label": _memory_agent_label(agent_key),
+                "color": _memory_agent_color(agent_key),
+                "reads": refs,
+            }
+        )
+    return jobs
+
+
+def _launchd_schedule_summary(data: Dict[str, Any]) -> Tuple[bool, str]:
+    bits: List[str] = []
+    if data.get("StartInterval"):
+        bits.append(f"every {data.get('StartInterval')}s")
+    if data.get("StartCalendarInterval"):
+        bits.append("calendar")
+    if data.get("WatchPaths"):
+        bits.append("watch paths")
+    if data.get("QueueDirectories"):
+        bits.append("queue watch")
+    if data.get("RunAtLoad"):
+        bits.append("run at load")
+    if data.get("KeepAlive"):
+        bits.append("keep alive")
+    return bool(bits), ", ".join(bits) if bits else "launchd"
+
+
+def _build_macos_launchd_jobs(root: Path, index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    jobs: List[Dict[str, Any]] = []
+    for directory in MACOS_LAUNCHD_DIRS:
+        try:
+            plist_paths = sorted(directory.glob("*.plist"))
+        except Exception:
+            continue
+        for plist_path in plist_paths:
+            try:
+                with plist_path.open("rb") as fh:
+                    data = plistlib.load(fh)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            scheduled, schedule = _launchd_schedule_summary(data)
+            program = str(data.get("Program") or "").strip()
+            program_args = [str(x).strip() for x in data.get("ProgramArguments", []) if str(x).strip()]
+            command = " ".join(program_args) if program_args else program
+            text_chunks = _flatten_job_strings(
+                [
+                    data.get("Label"),
+                    program,
+                    program_args,
+                    data.get("WatchPaths"),
+                    data.get("QueueDirectories"),
+                    data.get("WorkingDirectory"),
+                    data.get("EnvironmentVariables"),
+                    data.get("StandardInPath"),
+                    data.get("StandardOutPath"),
+                    data.get("StandardErrorPath"),
+                ]
+            )
+            refs = _job_memory_refs(text_chunks, plist_path.parent, root, index)
+            if not scheduled and not refs:
+                continue
+            label = str(data.get("Label") or plist_path.stem or "launchd job").strip()
+            agent_key = _memory_agent_key(" ".join([label, command]))
+            jobs.append(
+                {
+                    "id": "job_" + hashlib.md5(f"launchd:{plist_path}:{label}".encode("utf-8")).hexdigest()[:12],
+                    "label": label[:42],
+                    "kind": "job",
+                    "job_source": "launchd",
+                    "schedule": schedule,
+                    "command": command or label,
+                    "agent_key": agent_key,
+                    "agent_label": _memory_agent_label(agent_key),
+                    "color": _memory_agent_color(agent_key),
+                    "reads": refs,
+                    "path": str(plist_path),
+                }
+            )
+    return jobs
+
+
+def _discover_memory_jobs(root: Path, index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    system = platform.system()
+    if system == "Darwin":
+        return _build_macos_launchd_jobs(root, index)
+    if system == "Linux":
+        return _build_linux_cron_jobs(root, index)
+    return []
+
+
+def _build_memory_map(root: Path, max_files: int = MAX_FILES, max_depth: int = MAX_DEPTH) -> Dict[str, Any]:
+    root = root.resolve()
+    markdown_files = _collect_markdown_files(root, max_files=max_files, max_depth=max_depth)
+    index = _build_memory_file_index(root, markdown_files)
+
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    edge_weights: Dict[Tuple[str, str], int] = collections.Counter()
+    inbound_counts: Dict[str, int] = collections.Counter()
+    outbound_counts: Dict[str, int] = collections.Counter()
+
+    memory_nodes: Dict[str, Dict[str, Any]] = {}
+    for path in markdown_files:
+        node_id = index["id_by_path"][str(path)]
+        rel = path.relative_to(root).as_posix()
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            content = ""
+        agent_key = _memory_agent_key(" ".join([path.name, rel, content[:1200]]), allow_fallback=False)
+        if not agent_key and _is_agent_related(path):
+            agent_key = "assistant"
+        memory_nodes[node_id] = {
+            "id": node_id,
+            "label": path.stem,
+            "file_name": path.name,
+            "kind": "memory",
+            "path": str(path),
+            "relative_path": rel,
+            "file_type": "docs",
+            "size": len(content.encode("utf-8")),
+            "sensitive": _is_sensitive(path),
+            "agent_related": _is_agent_related(path),
+            "agent_key": agent_key,
+            "agent_label": _memory_agent_label(agent_key) if agent_key else "",
+            "inbound_refs": 0,
+            "outbound_refs": 0,
+            "importance": 20,
+            "color": "#64dfff" if _is_agent_related(path) else "#8fb7ff",
+            "mtime_unix": round(path.stat().st_mtime, 3) if path.exists() else 0.0,
+        }
+        for token in _extract_memory_ref_tokens(content):
+            target_id = _resolve_memory_ref_token(token, path.parent, root, index)
+            if not target_id or target_id == node_id:
+                continue
+            edge_weights[(node_id, target_id)] += 1
+
+    for (source_id, target_id), weight in edge_weights.items():
+        outbound_counts[source_id] += weight
+        inbound_counts[target_id] += weight
+        edges.append(
+            {
+                "source": source_id,
+                "target": target_id,
+                "kind": "reference",
+                "style": "solid",
+                "weight": weight,
+            }
+        )
+
+    for node_id, node in memory_nodes.items():
+        node["inbound_refs"] = int(inbound_counts.get(node_id, 0))
+        node["outbound_refs"] = int(outbound_counts.get(node_id, 0))
+        node["importance"] = min(
+            100,
+            24
+            + node["inbound_refs"] * 12
+            + node["outbound_refs"] * 4
+            + (12 if node.get("agent_related") else 0)
+            + (16 if node.get("sensitive") else 0),
+        )
+        nodes.append(node)
+
+    jobs = _discover_memory_jobs(root, index)
+    for job in jobs:
+        nodes.append(job)
+        for memory_id in job.get("reads", []):
+            edges.append(
+                {
+                    "source": job["id"],
+                    "target": memory_id,
+                    "kind": "job-read",
+                    "style": "dashed",
+                    "weight": 1,
+                }
+            )
+
+    stats = {
+        "total_memories": len(memory_nodes),
+        "total_jobs": len(jobs),
+        "total_references": len(edge_weights),
+        "job_edges": sum(1 for e in edges if e["kind"] == "job-read"),
+        "linked_memories": sum(1 for node in memory_nodes.values() if node["inbound_refs"] or node["outbound_refs"]),
+        "agent_breakdown": dict(
+            sorted(
+                collections.Counter(job.get("agent_label", "Job") for job in jobs).items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ),
+    }
+    return {
+        "root": str(root),
+        "root_name": root.name or str(root),
+        "generated_at_utc": _utc_now(),
+        "nodes": nodes,
+        "edges": edges,
+        "stats": stats,
+    }
+
+
+def _render_memory_map_html(
+    graph: Dict[str, Any],
+    title: str,
+    api_token: str = "",
+    initial_activity: Optional[Dict[str, Any]] = None,
+) -> str:
+    template = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; margin: 0; overflow: hidden;
+    background:
+      radial-gradient(circle at 18% 16%, rgba(34,211,238,0.08), transparent 28%),
+      radial-gradient(circle at 82% 14%, rgba(251,191,36,0.06), transparent 26%),
+      radial-gradient(circle at 50% 80%, rgba(74,222,128,0.05), transparent 32%),
+      linear-gradient(180deg, #030612 0%, #02040d 100%);
+    color: #d9e8f4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  .panel {
+    position: fixed; z-index: 10;
+    background: rgba(6, 12, 24, 0.82);
+    border: 1px solid rgba(110, 180, 255, 0.16);
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(14px);
+  }
+  #hud { top: 14px; left: 14px; width: 316px; padding: 14px 16px; }
+  #hud .title {
+    color: #8cf7ff; font-size: 13px; font-weight: 800;
+    letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 8px;
+  }
+  #hud .row { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0; font-size: 11px; }
+  #hud .k { color: #8298b0; }
+  #hud .v { color: #edf7ff; font-weight: 700; text-align: right; }
+  #hud .note { margin-top: 10px; color: #60748b; font-size: 10px; line-height: 1.45; }
+  #legend { top: 14px; right: 14px; width: 270px; padding: 12px 14px; }
+  #legend .title {
+    color: #ffd166; font-size: 12px; font-weight: 800;
+    letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px;
+  }
+  #legend .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 10px; color: #c0d2e4; }
+  #legend .dot { width: 10px; height: 10px; border-radius: 999px; flex: 0 0 auto; }
+  #search {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+    z-index: 11; display: flex; gap: 8px;
+  }
+  #search input {
+    width: 380px; padding: 10px 14px; border-radius: 999px;
+    border: 1px solid rgba(110,180,255,0.2);
+    background: rgba(4, 10, 20, 0.88); color: #eef8ff; outline: none;
+    font-family: inherit; font-size: 11px;
+  }
+  #search input::placeholder { color: #5d7188; }
+  .embedded-mode #search { display: none; }
+  #controls {
+    position: fixed; right: 18px; bottom: 18px; z-index: 11;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #controls button {
+    background: rgba(8, 16, 30, 0.9); border: 1px solid rgba(110,180,255,0.18);
+    color: #dce8f4; border-radius: 10px; padding: 8px 12px; cursor: pointer;
+    font-size: 10px; font-family: inherit; text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  #controls button:hover { background: rgba(18, 34, 58, 0.96); }
+  #inspector-layer {
+    position: fixed; inset: 0; z-index: 12; pointer-events: none;
+  }
+  .inspector-card {
+    position: fixed; width: 360px; padding: 0 0 14px;
+    max-height: calc(100vh - 140px); overflow: hidden; pointer-events: auto;
+  }
+  .inspector-card .panel-handle {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 10px 14px 8px; cursor: grab;
+    border-bottom: 1px solid rgba(110,180,255,0.12);
+  }
+  .inspector-card .panel-handle:active { cursor: grabbing; }
+  .inspector-card .panel-head {
+    color: #90f8ff; font-size: 11px; font-weight: 800;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .inspector-card .panel-actions { display: flex; align-items: center; gap: 8px; }
+  .inspector-card .grip { color: #54677b; font-size: 10px; letter-spacing: 2px; }
+  .inspector-card .close-btn {
+    appearance: none; border: 0; background: transparent; color: #7e96ac;
+    font-size: 16px; cursor: pointer; line-height: 1; padding: 0;
+  }
+  .inspector-card .close-btn:hover { color: #dce8f4; }
+  .inspector-card .inspector-node-label {
+    padding: 10px 16px 0; color: #dff6ff; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.03em;
+  }
+  .inspector-card .inspector-content {
+    padding: 8px 16px 0; max-height: calc(100vh - 220px); overflow: auto;
+  }
+  .inspector-card .name { color: #90f8ff; font-size: 15px; font-weight: 800; margin-bottom: 4px; }
+  .inspector-card .meta { color: #8ea5bc; font-size: 10px; margin-bottom: 6px; line-height: 1.45; }
+  .inspector-card .sep { height: 1px; background: rgba(110,180,255,0.12); margin: 10px 0; }
+  .inspector-card .tag {
+    display: inline-block; margin: 2px 4px 2px 0; padding: 2px 8px;
+    border-radius: 999px; font-size: 10px; font-weight: 700;
+  }
+  .inspector-card .list { margin: 6px 0 0; padding-left: 16px; color: #c7d9ea; font-size: 10px; line-height: 1.45; }
+  #empty {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    z-index: 9; color: #7f93aa; font-size: 12px; padding: 16px 20px;
+    border-radius: 14px; border: 1px solid rgba(125,175,255,0.12);
+    background: rgba(5,10,20,0.65); display: none;
+  }
+</style>
+</head>
+<body>
+<div id="hud" class="panel">
+  <div class="title">AI Activity Map</div>
+  <div class="row"><span class="k">Root</span><span class="v" id="hud-root"></span></div>
+  <div class="row"><span class="k">Memories</span><span class="v" id="hud-memories">0</span></div>
+  <div class="row"><span class="k">Jobs</span><span class="v" id="hud-jobs">0</span></div>
+  <div class="row"><span class="k">File refs</span><span class="v" id="hud-refs">0</span></div>
+  <div class="row"><span class="k">Active agents</span><span class="v" id="hud-active-agents">0</span></div>
+  <div class="row"><span class="k">Running jobs</span><span class="v" id="hud-running-jobs">0</span></div>
+  <div class="row"><span class="k">Hot memories</span><span class="v" id="hud-hot-memories">0</span></div>
+  <div class="row"><span class="k">Top task</span><span class="v" id="hud-top-task">idle</span></div>
+  <div class="row"><span class="k">Last update</span><span class="v" id="hud-last-update">static</span></div>
+  <div class="note">
+    Static memory topology stays in place. Live shell activity overlays agents, running jobs, recent memory heat, and pulsing active paths every few seconds.
+  </div>
+</div>
+<div id="legend" class="panel">
+  <div class="title">Legend</div>
+  <div class="row"><div class="dot" style="background:#8fb7ff;box-shadow:0 0 14px #8fb7ff;"></div><span>Memory file</span></div>
+  <div class="row"><div class="dot" style="background:#ff6b6b;box-shadow:0 0 14px #ff6b6b;"></div><span>Sensitive memory</span></div>
+  <div class="row"><div class="dot" style="background:#64dfff;box-shadow:0 0 14px #64dfff;"></div><span>Agent-related memory</span></div>
+  <div class="row"><div class="dot" style="background:#5eead4;border-radius:3px;width:14px;"></div><span>Scheduled job</span></div>
+  <div class="row"><div class="dot" style="background:#22c55e;box-shadow:0 0 14px #22c55e;"></div><span>Live agent node</span></div>
+  <div class="row"><div class="dot" style="background:#ffc857;"></div><span>Pulsing active edge</span></div>
+  <div class="row"><div class="dot" style="background:#f97316;"></div><span>Recent file heat / touch</span></div>
+</div>
+<div id="search"><input id="search-input" type="text" placeholder="Search memories, paths, jobs, agents..." /></div>
+<div id="controls">
+  <button onclick="resetView()">Reset View</button>
+  <button onclick="reLayout()">Re-Layout</button>
+  <button onclick="toggleJobs()">Toggle Jobs</button>
+  <button onclick="toggleAgents()">Toggle Agents</button>
+</div>
+<div id="inspector-layer"></div>
+<div id="empty">No markdown memories were found in the selected workspace.</div>
+<canvas id="map"></canvas>
+<script>
+const graph = __GRAPH_JSON__;
+const API_TOKEN = __API_TOKEN_JSON__;
+const initialActivity = __INITIAL_ACTIVITY_JSON__;
+const canvas = document.getElementById("map");
+const ctx = canvas.getContext("2d");
+const searchInput = document.getElementById("search-input");
+const inspectorLayer = document.getElementById("inspector-layer");
+const empty = document.getElementById("empty");
+const embeddedMode = window.self !== window.top;
+document.body.classList.toggle("embedded-mode", embeddedMode);
+const nodes = (graph.nodes || []).map((node) => ({
+  ...node,
+  searchMatch: false,
+  activityHeat: 0,
+  targetHeat: 0,
+  runtimeReasons: [],
+  runtimeAgents: [],
+  fixed: false,
+  hidden: false,
+  vx: 0,
+  vy: 0,
+}));
+const edges = (graph.edges || []).map((edge) => ({ ...edge }));
+const nodeMap = {};
+nodes.forEach((node) => { nodeMap[node.id] = node; });
+const memoryNodes = nodes.filter((node) => node.kind === "memory");
+const jobNodes = nodes.filter((node) => node.kind === "job");
+const runtimeAgentMap = {};
+let runtimeAgents = [];
+let runtimeEdges = [];
+let runtimeOrbitals = [];
+let showJobs = true;
+let showAgents = true;
+let selectedNode = null;
+let draggedNode = null;
+let pointerDown = false;
+let dragMode = null;
+let dragStart = null;
+let pointerTravel = 0;
+let camX = 0;
+let camY = 0;
+let camZoom = 1;
+let lastFrameTs = performance.now();
+let lastActivity = null;
+let inspectorPanelZ = 30;
+const openInspectors = new Map();
+
+document.getElementById("hud-root").textContent = graph.root_name || "workspace";
+document.getElementById("hud-memories").textContent = String((graph.stats || {}).total_memories || 0);
+document.getElementById("hud-jobs").textContent = String((graph.stats || {}).total_jobs || 0);
+document.getElementById("hud-refs").textContent = String((graph.stats || {}).total_references || 0);
+empty.style.display = ((graph.stats || {}).total_memories || 0) ? "none" : "block";
+
+const W = () => canvas.clientWidth || window.innerWidth || 1280;
+const H = () => canvas.clientHeight || window.innerHeight || 900;
+
+function fetchJsonWithTimeout(url, timeoutMs = 12000, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const merged = {
+    credentials: "same-origin",
+    cache: "no-store",
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      "X-Parad0x-Token": API_TOKEN,
+    },
+    signal: controller.signal,
+  };
+  return fetch(url, merged)
+    .then((resp) => {
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return resp.json();
+    })
+    .finally(() => clearTimeout(timer));
+}
+
+function normalize(text) {
+  return String(text || "").toLowerCase().trim();
+}
+
+function memoryAgentKey(text) {
+  const raw = normalize(text);
+  const patterns = {
+    codex: ["codex"],
+    cursor: ["cursor"],
+    claude: ["claude", "anthropic"],
+    gpt: ["openai", "chatgpt", "gpt"],
+    aider: ["aider"],
+    assistant: ["assistant", "agent", "automation", "memory"],
+  };
+  for (const [key, names] of Object.entries(patterns)) {
+    if (names.some((name) => raw.includes(name))) return key;
+  }
+  return raw.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "agent";
+}
+
+function memoryAgentLabel(key) {
+  return String(key || "Agent")
+    .replace(/[_-]+/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1))
+    .join(" ") || "Agent";
+}
+
+function isRuntimeAgentProcess(proc) {
+  const hay = normalize(`${proc.name || ""} ${proc.raw_name || ""} ${proc.category || ""}`);
+  if (proc.category === "agent") return true;
+  if (["codex", "cursor", "claude", "openclaw", "aider", "copilot", "antigravity", "chatgpt"].some((key) => hay.includes(key))) {
+    return true;
+  }
+  if (proc.category === "ide" && ["gpt", "anthropic", "assistant", "agent"].some((key) => hay.includes(key))) {
+    return true;
+  }
+  return false;
+}
+
+function worldToScreen(wx, wy) {
+  return { sx: (wx - camX) * camZoom + W() / 2, sy: (wy - camY) * camZoom + H() / 2 };
+}
+
+function screenToWorld(sx, sy) {
+  return { wx: (sx - W() / 2) / camZoom + camX, wy: (sy - H() / 2) / camZoom + camY };
+}
+
+function memoryRadius(node) {
+  return 8 + Math.min(30, Math.sqrt((node.inbound_refs || 0) + 1) * 5) + (node.activityHeat || 0) * 6;
+}
+
+function jobBox(node) {
+  return { w: Math.max(98, Math.min(172, (String(node.label || "").length * 7) + 24)), h: 24 };
+}
+
+function agentRadius(node) {
+  return 14 + Math.min(12, Math.sqrt((node.cpu_pct || 0) + (node.mem_pct || 0) + 1) * 1.6);
+}
+
+function perimeterPosition(index, total) {
+  const width = 1120, height = 760, margin = 96;
+  if (total <= 1) return { x: 0, y: -(height / 2 + margin) };
+  const perimeter = 2 * (width + height);
+  let dist = (perimeter / total) * index;
+  if (dist <= width) return { x: -width / 2 + dist, y: -(height / 2 + margin) };
+  dist -= width;
+  if (dist <= height) return { x: width / 2 + margin, y: -height / 2 + dist };
+  dist -= height;
+  if (dist <= width) return { x: width / 2 - dist, y: height / 2 + margin };
+  dist -= width;
+  return { x: -(width / 2 + margin), y: height / 2 - dist };
+}
+
+function initPositions() {
+  memoryNodes.forEach((node, index) => {
+    const angle = (Math.PI * 2 * index) / Math.max(1, memoryNodes.length);
+    const radius = 140 + Math.sqrt(index + 1) * 28;
+    node.x = Math.cos(angle) * radius;
+    node.y = Math.sin(angle) * radius;
+    node.vx = 0;
+    node.vy = 0;
+    node.fixed = false;
+  });
+  jobNodes.forEach((node, index) => {
+    const pos = perimeterPosition(index, Math.max(1, jobNodes.length));
+    node.x = pos.x;
+    node.y = pos.y;
+    node.vx = 0;
+    node.vy = 0;
+    node.fixed = true;
+  });
+}
+initPositions();
+
+function recencyHeat(node, nowUnix) {
+  const age = Math.max(0, nowUnix - Number(node.mtime_unix || 0));
+  if (!Number(node.mtime_unix || 0)) return 0;
+  if (age <= 120) return 1;
+  if (age <= 900) return 0.74;
+  if (age <= 3600) return 0.42;
+  if (age <= 14400) return 0.18;
+  return 0;
+}
+
+function commandMemoryMatches(text) {
+  const raw = normalize(text);
+  if (!raw) return [];
+  const scored = [];
+  for (const node of memoryNodes) {
+    let score = 0;
+    const fileName = normalize(node.file_name);
+    const relPath = normalize(node.relative_path);
+    const label = normalize(node.label);
+    if (fileName && raw.includes(fileName)) score += 8;
+    if (relPath && raw.includes(relPath)) score += 10;
+    if (label && label.length >= 4 && raw.includes(label)) score += 4;
+    if (score > 0) scored.push({ id: node.id, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 6).map((item) => item.id);
+}
+
+function relatedMemoriesForAgent(agent, activityText) {
+  const scored = [];
+  for (const node of memoryNodes) {
+    let score = recencyHeat(node, Date.now() / 1000) * 2.2;
+    if (node.agent_key && agent.agent_key && node.agent_key === agent.agent_key) score += 10;
+    const hay = normalize([node.label, node.file_name, node.relative_path, node.path, node.agent_label].filter(Boolean).join(" "));
+    if (agent.agent_key && hay.includes(agent.agent_key)) score += 4;
+    if (hay.includes(normalize(agent.label))) score += 3;
+    if (activityText && (hay.includes(activityText) || activityText.includes(normalize(node.file_name)))) score += 2.5;
+    if (node.agent_related) score += 1.4;
+    score += Math.min(2.6, Number(node.inbound_refs || 0) * 0.25);
+    if (score > 0.6) scored.push({ id: node.id, score });
+  }
+  scored.sort((a, b) => (b.score - a.score) || ((nodeMap[b.id].importance || 0) - (nodeMap[a.id].importance || 0)));
+  const picked = scored.slice(0, 6).map((item) => item.id);
+  if (picked.length) return picked;
+  return memoryNodes
+    .filter((node) => node.agent_related)
+    .sort((a, b) => (b.importance || 0) - (a.importance || 0))
+    .slice(0, 3)
+    .map((node) => node.id);
+}
+
+function ensureRuntimeAgent(agent) {
+  let node = runtimeAgentMap[agent.id];
+  if (!node) {
+    node = {
+      id: agent.id,
+      kind: "runtime-agent",
+      label: agent.label,
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      fixed: false,
+      searchMatch: false,
+      seenAt: performance.now(),
+    };
+    runtimeAgentMap[agent.id] = node;
+    runtimeAgents.push(node);
+  }
+  Object.assign(node, agent, { seenAt: performance.now() });
+  if (typeof node.x !== "number" || typeof node.y !== "number") {
+    node.x = Math.random() * 120 - 60;
+    node.y = Math.random() * 120 - 60;
+  }
+  return node;
+}
+
+function formatTimeAgo(ts) {
+  if (!ts) return "now";
+  const millis = Date.parse(ts);
+  if (!Number.isFinite(millis)) return "now";
+  const delta = Math.max(0, Math.round((Date.now() - millis) / 1000));
+  if (delta < 5) return "now";
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.round(delta / 60)}m ago`;
+  return `${Math.round(delta / 3600)}h ago`;
+}
+
+function formatCompactTokens(value) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num) || num <= 0) return "0 tok";
+  if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M tok`;
+  if (num >= 1000) return `${(num / 1000).toFixed(1)}k tok`;
+  return `${Math.round(num)} tok`;
+}
+
+function compactLabel(text, limit = 18) {
+  const raw = String(text || "").trim();
+  if (!raw) return "idle";
+  return raw.length <= limit ? raw : `${raw.slice(0, Math.max(3, limit - 1))}…`;
+}
+
+function compactModelLabel(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "model";
+  return compactLabel(raw.replace(/[:/]/g, " "), 16);
+}
+
+function orbitalRadius(node) {
+  if (node.orbital_kind === "task") return 11;
+  if (node.orbital_kind === "tokens") return 10 + Math.min(6, Math.log10(Number(node.token_value || 1) + 1) * 2.4);
+  if (node.orbital_kind === "process") return 7.4;
+  if (node.orbital_kind === "status") return 8.6;
+  return 8;
+}
+
+function orbitalPosition(agent, orbital, index, total, time) {
+  const radius = agentRadius(agent) + 42 + index * 8;
+  const base = ((Math.PI * 2) / Math.max(1, total)) * index;
+  const spin = time * 0.00045 + (agent.spinSeed || 0);
+  return {
+    x: agent.x + Math.cos(base + spin) * radius,
+    y: agent.y + Math.sin(base + spin) * radius,
+  };
+}
+
+function agentUsageAffinity(agent, aiUsage, event) {
+  const hay = normalize([agent.label, agent.raw_name, agent.agent_key, agent.agent_label].filter(Boolean).join(" "));
+  const model = normalize((event || {}).model);
+  const source = normalize(aiUsage.source || "");
+  let score = Number(agent.cpu_pct || 0) + Number(agent.mem_pct || 0) * 0.3;
+  if (source.includes("codex") && (hay.includes("codex") || hay.includes("cursor") || hay.includes("chatgpt") || hay.includes("gpt"))) score += 10;
+  if (model.includes("claude") && (hay.includes("claude") || hay.includes("cursor") || hay.includes("anthropic"))) score += 8;
+  if ((model.includes("gpt") || model.includes("o1") || model.includes("o3") || model.includes("o4")) && (hay.includes("codex") || hay.includes("cursor") || hay.includes("gpt") || hay.includes("chatgpt"))) score += 8;
+  if (model.includes("gemini") && hay.includes("gemini")) score += 8;
+  if (hay.includes("copilot") && (model.includes("gpt") || model.includes("o1") || model.includes("o3"))) score += 5;
+  if (agent.status_label === "ACTIVE") score += 1.4;
+  return score;
+}
+
+function buildAgentOrbitals(agent, aiUsage) {
+  const orbitals = [];
+  const procCount = Math.max(1, Number(agent.instance_count || 1));
+  const processDetail = `CPU ${Number(agent.cpu_pct || 0).toFixed(1)}% · RAM ${Number(agent.mem_pct || 0).toFixed(1)}%`;
+  orbitals.push({
+    id: `${agent.id}_task`,
+    kind: "agent-orbital",
+    orbital_kind: "task",
+    parent_id: agent.id,
+    label: compactLabel(agent.current_task || "idle", 18),
+    detail: `Task · ${agent.current_task || "idle"}`,
+    color: "#7dd3fc",
+  });
+  const tokenEvents = Array.isArray(agent.recent_token_events) ? agent.recent_token_events.slice(0, 3) : [];
+  if (tokenEvents.length) {
+    tokenEvents.forEach((event, index) => {
+      orbitals.push({
+        id: `${agent.id}_tokens_${index}`,
+        kind: "agent-orbital",
+        orbital_kind: "tokens",
+        parent_id: agent.id,
+        label: formatCompactTokens(event.total_tokens),
+        detail: `${compactModelLabel(event.model)} · ${formatTimeAgo(event.ts)} · $${Number(event.cost_usd || 0).toFixed(4)}`,
+        color: "#f59e0b",
+        token_value: Number(event.total_tokens || 0),
+      });
+    });
+  } else {
+    const estTaskTokens = Math.max(
+      Number(agent.token_burst_estimate || 0),
+      Number(aiUsage.peak_event_tokens || aiUsage.last_event_tokens || aiUsage.avg_tokens_per_call || 0),
+    );
+    orbitals.push({
+      id: `${agent.id}_tokens`,
+      kind: "agent-orbital",
+      orbital_kind: "tokens",
+      parent_id: agent.id,
+      label: formatCompactTokens(estTaskTokens),
+      detail: `${compactModelLabel(agent.token_model || aiUsage.last_event_model || aiUsage.peak_event_model || aiUsage.top_models?.[0]?.[0] || "model")} · best-effort task burst`,
+      color: "#f59e0b",
+      token_value: estTaskTokens,
+    });
+  }
+  const pids = Array.isArray(agent.pids) ? agent.pids.filter((pid) => Number(pid || 0) > 0).map((pid) => Number(pid)) : [];
+  const visiblePids = pids.slice(0, 3);
+  visiblePids.forEach((pid, index) => {
+    orbitals.push({
+      id: `${agent.id}_proc_${pid}`,
+      kind: "agent-orbital",
+      orbital_kind: "process",
+      parent_id: agent.id,
+      label: `PID ${pid}`,
+      detail: `Process ${index + 1}/${procCount} · ${processDetail}`,
+      color: "#22c55e",
+    });
+  });
+  if (procCount > visiblePids.length) {
+    orbitals.push({
+      id: `${agent.id}_proc_more`,
+      kind: "agent-orbital",
+      orbital_kind: "process",
+      parent_id: agent.id,
+      label: `+${procCount - visiblePids.length}`,
+      detail: `Additional grouped processes · ${processDetail}`,
+      color: "#22c55e",
+    });
+  }
+  orbitals.push({
+    id: `${agent.id}_status`,
+    kind: "agent-orbital",
+    orbital_kind: "status",
+    parent_id: agent.id,
+    label: agent.progress_pct != null ? `${Math.round(agent.progress_pct)}%` : compactLabel(agent.status_label || "ACTIVE", 10),
+    detail: `Status · ${agent.status_label || "ACTIVE"} · heartbeat ${agent.heartbeat_label || "not armed"}`,
+    color: agent.status_color || "#38bdf8",
+  });
+  return orbitals;
+}
+
+function syncRuntimeOrbitals(time) {
+  const groups = {};
+  runtimeOrbitals = runtimeOrbitals.filter((orbital) => runtimeAgentMap[orbital.parent_id]);
+  runtimeOrbitals.forEach((orbital) => {
+    if (!groups[orbital.parent_id]) groups[orbital.parent_id] = [];
+    groups[orbital.parent_id].push(orbital);
+  });
+  Object.values(groups).forEach((group) => {
+    group.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    const parent = runtimeAgentMap[group[0].parent_id];
+    if (!parent) return;
+    group.forEach((orbital, index) => {
+      const pos = orbitalPosition(parent, orbital, index, group.length, time);
+      orbital.x = pos.x;
+      orbital.y = pos.y;
+    });
+  });
+}
+
+function inspectorPanelId(nodeId) {
+  return "ai-map-inspector-" + String(nodeId || "node").replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 72);
+}
+
+function inspectorPanelTitle(node) {
+  return compactLabel(node.label || node.file_name || node.id || "Node", 26);
+}
+
+function inspectorStartPosition(index) {
+  return {
+    top: 112 + (index % 4) * 28,
+    right: 18 + Math.floor(index / 4) * 34,
+  };
+}
+
+function bringInspectorToFront(panel) {
+  if (!panel) return;
+  inspectorPanelZ += 1;
+  panel.style.zIndex = String(inspectorPanelZ);
+}
+
+function resolveInspectorNode(nodeId) {
+  return runtimeAgentMap[nodeId] || nodeMap[nodeId] || runtimeOrbitals.find((node) => node.id === nodeId) || null;
+}
+
+function renderInspectorHtml(node) {
+  const tags = [];
+  if (node.kind === "agent-orbital") {
+    const parent = runtimeAgentMap[node.parent_id] || null;
+    tags.push(`<span class="tag" style="background:${node.color || '#7dd3fc'};color:#061019">${String(node.orbital_kind || 'orbit').toUpperCase()}</span>`);
+    if (parent) tags.push(`<span class="tag" style="background:#22c55e;color:#061019">${parent.label}</span>`);
+    return `
+      <div class="name">${node.label}</div>
+      <div class="meta">Agent orbital · ${node.orbital_kind || "detail"}</div>
+      <div>${tags.join("")}</div>
+      <div class="sep"></div>
+      <div class="meta">${node.detail || "no detail"}</div>
+      ${parent ? `<div class="meta">Parent agent: ${parent.label}</div>` : ""}
+    `;
+  } else if (node.kind === "runtime-agent") {
+    const color = node.status_color || "#22c55e";
+    tags.push(`<span class="tag" style="background:${color};color:#061019">${node.status_label || "ACTIVE"}</span>`);
+    tags.push(`<span class="tag" style="background:#7dd3fc;color:#061019">${node.agent_label || "Agent"}</span>`);
+    return `
+      <div class="name">${node.label}</div>
+      <div class="meta">Live agent runtime · updated ${formatTimeAgo(node.last_update || "")}</div>
+      <div>${tags.join("")}</div>
+      <div class="sep"></div>
+      <div class="meta">Current task: ${node.current_task || "idle"}</div>
+      <div class="meta">Best-effort progress: ${node.progress_pct != null ? `${node.progress_pct}%` : "unknown"}</div>
+      <div class="meta">Best-effort task tokens: ${formatCompactTokens(node.token_burst_estimate || 0)}${node.token_model ? ` · ${node.token_model}` : ""}</div>
+      <div class="meta">CPU ${Number(node.cpu_pct || 0).toFixed(1)}% · RAM ${Number(node.mem_pct || 0).toFixed(1)}%</div>
+      <div class="meta">Grouped processes: ${Number(node.instance_count || 1)}</div>
+      <div class="meta">Workspace heartbeat: ${node.heartbeat_label || "n/a"}</div>
+      <div class="meta">Latest blocker: ${node.latest_error || "none"}</div>
+      <div class="sep"></div>
+      <div class="meta">Related memories: ${(node.related_memories || []).length}</div>
+      <ul class="list">${(node.related_memories || []).map((id) => `<li>${(nodeMap[id] || {}).relative_path || (nodeMap[id] || {}).label || id}</li>`).join("") || "<li>No mapped memories</li>"}</ul>
+    `;
+  } else if (node.kind === "job") {
+    const state = node.runtime_state || "queued";
+    tags.push(`<span class="tag" style="background:${node.runtime_state_color || node.color || '#5eead4'};color:#061019">${state.toUpperCase()}</span>`);
+    if (node.agent_label) tags.push(`<span class="tag" style="background:#8dd3ff;color:#07111d">${node.agent_label}</span>`);
+    return `
+      <div class="name">${node.label}</div>
+      <div class="meta">${node.schedule || "scheduled job"} · ${node.job_source || "job"}</div>
+      <div>${tags.join("")}</div>
+      <div class="sep"></div>
+      <div class="meta" style="word-break:break-word;">${node.command || ""}</div>
+      ${node.path ? `<div class="meta" style="word-break:break-word;">${node.path}</div>` : ""}
+      <div class="sep"></div>
+      <div class="meta">Live state: ${node.runtime_detail || "waiting for activity"}</div>
+      <div class="meta">Reads ${(node.reads || []).length} memory file(s).</div>
+    `;
+  } else {
+    const color = node.sensitive ? "#ff6b6b" : (node.agent_related ? "#64dfff" : "#8fb7ff");
+    tags.push(`<span class="tag" style="background:${color};color:#061019">MEMORY</span>`);
+    if (node.sensitive) tags.push(`<span class="tag" style="background:#ff6b6b;color:#fff">SENSITIVE</span>`);
+    if (node.agent_label) tags.push(`<span class="tag" style="background:#67e8f9;color:#061019">${node.agent_label}</span>`);
+    return `
+      <div class="name">${node.label}</div>
+      <div class="meta">${node.file_name || ""}</div>
+      <div>${tags.join("")}</div>
+      <div class="sep"></div>
+      <div class="meta" style="word-break:break-word;">${node.relative_path || node.path || ""}</div>
+      <div class="meta">Inbound refs: ${node.inbound_refs || 0} · Outbound refs: ${node.outbound_refs || 0}</div>
+      <div class="meta">Live heat: ${Math.round((node.activityHeat || 0) * 100)}%</div>
+      <div class="meta">Recent touches: ${(node.runtimeReasons || []).slice(0, 2).join(" · ") || "none"}</div>
+      <div class="sep"></div>
+      <div class="meta">Active agents: ${(node.runtimeAgents || []).join(", ") || "none"}</div>
+    `;
+  }
+}
+
+function ensureInspectorEntry(node) {
+  const nodeId = String(node.id || "");
+  let entry = openInspectors.get(nodeId);
+  if (entry) return entry;
+  const panelId = inspectorPanelId(nodeId);
+  const pos = inspectorStartPosition(openInspectors.size);
+  const panel = document.createElement("div");
+  panel.id = panelId;
+  panel.className = "panel inspector-card";
+  panel.setAttribute("data-node-id", nodeId);
+  panel.setAttribute("data-inspector-panel", panelId);
+  panel.style.top = `${pos.top}px`;
+  panel.style.right = `${pos.right}px`;
+  panel.style.left = "auto";
+  panel.style.bottom = "auto";
+  panel.innerHTML = `
+    <div class="panel-handle" data-inspector-drag="${panelId}">
+      <span class="panel-head">Inspector</span>
+      <span class="panel-actions">
+        <button class="close-btn" data-inspector-close="${nodeId}" title="Close">&times;</button>
+        <span class="grip">&equiv;</span>
+      </span>
+    </div>
+    <div class="inspector-node-label"></div>
+    <div class="inspector-content"></div>
+  `;
+  inspectorLayer.appendChild(panel);
+  entry = {
+    panelId,
+    panel,
+    titleEl: panel.querySelector(".inspector-node-label"),
+    contentEl: panel.querySelector(".inspector-content"),
+  };
+  openInspectors.set(nodeId, entry);
+  bringInspectorToFront(panel);
+  return entry;
+}
+
+function openInspectorForNode(node, opts = {}) {
+  const liveNode = resolveInspectorNode(String(node.id || "")) || node;
+  const entry = ensureInspectorEntry(liveNode);
+  entry.panel.setAttribute("data-node-id", String(liveNode.id));
+  entry.titleEl.textContent = inspectorPanelTitle(liveNode);
+  entry.contentEl.innerHTML = renderInspectorHtml(liveNode);
+  if (opts.focus !== false) bringInspectorToFront(entry.panel);
+}
+
+function refreshInspectorCards() {
+  Array.from(openInspectors.keys()).forEach((nodeId) => {
+    const entry = openInspectors.get(nodeId);
+    const liveNode = resolveInspectorNode(nodeId);
+    if (!entry) return;
+    if (!liveNode) {
+      entry.panel.remove();
+      openInspectors.delete(nodeId);
+      return;
+    }
+    entry.titleEl.textContent = inspectorPanelTitle(liveNode);
+    entry.contentEl.innerHTML = renderInspectorHtml(liveNode);
+  });
+}
+
+function closeInspector(nodeId) {
+  const key = String(nodeId || "");
+  const entry = openInspectors.get(key);
+  if (!entry) return;
+  entry.panel.remove();
+  openInspectors.delete(key);
+  if (selectedNode && String(selectedNode.id || "") === key) selectedNode = null;
+}
+
+function updateInspector() {
+  if (!selectedNode) return;
+  openInspectorForNode(selectedNode);
+}
+
+function applySearch() {
+  const query = normalize(document.getElementById("search-input").value);
+  for (const node of nodes) {
+    const hay = normalize([node.label, node.file_name, node.relative_path, node.path, node.command, node.agent_label].filter(Boolean).join(" "));
+    node.searchMatch = !!query && hay.includes(query);
+  }
+  for (const agent of runtimeAgents) {
+    const hay = normalize([agent.label, agent.current_task, agent.agent_label].filter(Boolean).join(" "));
+    agent.searchMatch = !!query && hay.includes(query);
+  }
+  for (const orbital of runtimeOrbitals) {
+    const parent = runtimeAgentMap[orbital.parent_id];
+    const hay = normalize([orbital.label, orbital.detail, orbital.orbital_kind, parent ? parent.label : "", parent ? parent.current_task : ""].filter(Boolean).join(" "));
+    orbital.searchMatch = !!query && hay.includes(query);
+  }
+}
+
+function deriveLiveActivity(stats) {
+  const nowUnix = Date.now() / 1000;
+  const threat = stats.threat || {};
+  const task = stats.task_progress || {};
+  const activityFeed = Array.isArray(stats.activity_feed) ? stats.activity_feed : [];
+  const lastAction = task.last_action || {};
+  const aiUsage = stats.ai_usage || {};
+  const activityText = normalize([
+    task.phase,
+    lastAction.type,
+    lastAction.command,
+    ...activityFeed.map((row) => `${row.label || ""} ${row.detail || ""}`),
+    ...(threat.alerts || []),
+  ].join(" "));
+
+  const heatByMemory = {};
+  for (const node of memoryNodes) {
+    const heat = recencyHeat(node, nowUnix);
+    heatByMemory[node.id] = { heat, reasons: heat ? ["recent write"] : [], agents: [] };
+  }
+
+  const activeProcesses = (stats.processes || [])
+    .filter((proc) => isRuntimeAgentProcess(proc))
+    .sort((a, b) => ((Number(b.cpu_pct || 0) + Number(b.mem_pct || 0)) - (Number(a.cpu_pct || 0) + Number(a.mem_pct || 0))))
+    .slice(0, 8);
+
+  const activeAgents = activeProcesses.map((proc, index) => {
+    const rawName = String(proc.raw_name || proc.name || "agent");
+    const agentKey = memoryAgentKey(`${proc.name || ""} ${rawName}`);
+    const related = relatedMemoriesForAgent({ label: proc.name || "agent", agent_key: agentKey }, activityText);
+    const signal = Number(proc.cpu_pct || 0) + Number(proc.mem_pct || 0);
+    const progress = task.phase && task.phase !== "idle"
+      ? Math.max(8, Math.min(99, index === 0 ? Number(task.sync_pct || 0) : Math.round(Math.min(95, signal * 3.4 + 8))))
+      : Math.max(2, Math.min(88, Math.round(signal * 3)));
+    const heartbeatAge = threat.heartbeat && threat.heartbeat.present ? Number(threat.heartbeat.age_s || 0) : null;
+    let statusLabel = "ACTIVE";
+    let statusColor = "#22c55e";
+    if (threat.halt_present) {
+      statusLabel = "HALT";
+      statusColor = "#ef4444";
+    } else if (threat.level === "red" && index === 0) {
+      statusLabel = "ALARM";
+      statusColor = "#f97316";
+    } else if (signal < 2.5) {
+      statusLabel = "WATCH";
+      statusColor = "#facc15";
+    }
+    const matchedTask = normalize(lastAction.command || "").includes(agentKey) ? String(lastAction.command || "").slice(0, 80) : "";
+    return {
+      id: `agent_live_${proc._group || proc.pid}`,
+      kind: "runtime-agent",
+      label: proc.name || "Agent",
+      raw_name: rawName,
+      agent_key: agentKey,
+      agent_label: memoryAgentLabel(agentKey),
+      status_label: statusLabel,
+      status_color: statusColor,
+      cpu_pct: Number(proc.cpu_pct || 0),
+      mem_pct: Number(proc.mem_pct || 0),
+      instance_count: Number(proc.instance_count || 1),
+      pids: Array.isArray(proc._pids) ? proc._pids.slice(0, 12) : [Number(proc.pid || 0)].filter(Boolean),
+      current_task: matchedTask || String(lastAction.command || task.phase || "observing").slice(0, 96),
+      progress_pct: Number.isFinite(progress) ? Math.round(progress) : null,
+      last_update: stats.timestamp || "",
+      latest_error: (threat.alerts || [])[0] || "",
+      heartbeat_label: threat.heartbeat && threat.heartbeat.present
+        ? (threat.heartbeat.fresh ? `fresh (${Math.round(heartbeatAge || 0)}s)` : `stale (${Math.round(heartbeatAge || 0)}s)`)
+        : "not armed",
+      related_memories: related,
+      spinSeed: index * 0.9,
+      token_burst_estimate: Math.max(Number(aiUsage.last_event_tokens || 0), Number(aiUsage.avg_tokens_per_call || 0)),
+      token_model: String(aiUsage.last_event_model || aiUsage.peak_event_model || (aiUsage.top_models || [])[0]?.[0] || ""),
+      recent_token_events: [],
+    };
+  });
+
+  const recentEvents = Array.isArray(aiUsage.recent_events) ? aiUsage.recent_events.slice(0, 8) : [];
+  for (const event of recentEvents) {
+    let bestAgent = null;
+    let bestScore = -Infinity;
+    for (const agent of activeAgents) {
+      const score = agentUsageAffinity(agent, aiUsage, event);
+      if (score > bestScore) {
+        bestScore = score;
+        bestAgent = agent;
+      }
+    }
+    if (bestAgent) bestAgent.recent_token_events.push(event);
+  }
+  for (const agent of activeAgents) {
+    if (!agent.recent_token_events.length) continue;
+    const peak = agent.recent_token_events.reduce((maxValue, event) => Math.max(maxValue, Number(event.total_tokens || 0)), 0);
+    agent.token_burst_estimate = Math.max(Number(agent.token_burst_estimate || 0), peak);
+    const primaryModel = String(agent.recent_token_events[0]?.model || agent.token_model || "");
+    if (primaryModel) agent.token_model = primaryModel;
+  }
+
+  const jobStateById = {};
+  const liveEdges = [];
+  const lastText = normalize(`${lastAction.type || ""} ${lastAction.command || ""}`);
+  for (const agent of activeAgents) {
+    for (const memoryId of agent.related_memories) {
+      const slot = heatByMemory[memoryId];
+      if (!slot) continue;
+      slot.heat = Math.max(slot.heat, 0.78);
+      if (!slot.reasons.includes(`active ${agent.label}`)) slot.reasons.push(`active ${agent.label}`);
+      if (!slot.agents.includes(agent.label)) slot.agents.push(agent.label);
+      liveEdges.push({
+        id: `edge_${agent.id}_${memoryId}`,
+        source: agent.id,
+        target: memoryId,
+        kind: "agent-memory",
+        color: agent.status_color,
+        intensity: 0.92,
+      });
+    }
+  }
+
+  const taskMemoryHits = commandMemoryMatches(`${lastAction.command || ""} ${(activityFeed[0] || {}).detail || ""}`);
+  for (const memoryId of taskMemoryHits) {
+    const slot = heatByMemory[memoryId];
+    if (!slot) continue;
+    slot.heat = Math.max(slot.heat, 0.84);
+    if (!slot.reasons.includes("task activity")) slot.reasons.push("task activity");
+  }
+
+  for (const job of jobNodes) {
+    const matchingAgents = activeAgents.filter((agent) => agent.agent_key && job.agent_key && agent.agent_key === job.agent_key);
+    let state = "queued";
+    let color = "#5eead4";
+    let detail = "waiting for a matching active agent";
+    if (matchingAgents.length) {
+      state = "running";
+      color = "#22c55e";
+      detail = `active via ${matchingAgents[0].label}`;
+      for (const agent of matchingAgents) {
+        liveEdges.push({
+          id: `edge_${agent.id}_${job.id}`,
+          source: agent.id,
+          target: job.id,
+          kind: "agent-job",
+          color: "#22c55e",
+          intensity: 0.84,
+        });
+      }
+      for (const memoryId of job.reads || []) {
+        const slot = heatByMemory[memoryId];
+        if (!slot) continue;
+        slot.heat = Math.max(slot.heat, 0.72);
+        if (!slot.reasons.includes(`job ${job.label}`)) slot.reasons.push(`job ${job.label}`);
+        liveEdges.push({
+          id: `edge_${job.id}_${memoryId}`,
+          source: job.id,
+          target: memoryId,
+          kind: "job-memory-live",
+          color: "#ffd166",
+          intensity: 0.74,
+        });
+      }
+    } else if ((job.command && lastText.includes(normalize(job.command))) || (job.label && lastText.includes(normalize(job.label))) || (job.agent_key && lastText.includes(job.agent_key))) {
+      const failed = (lastAction.approval_ok === false) || (lastAction.action_rc != null && Number(lastAction.action_rc) !== 0);
+      state = failed ? "failed" : "succeeded";
+      color = failed ? "#ef4444" : "#3b82f6";
+      detail = failed ? "latest matching action failed" : "recent matching action completed";
+    }
+    jobStateById[job.id] = { state, color, detail };
+  }
+
+  for (const node of memoryNodes) {
+    const slot = heatByMemory[node.id] || { heat: 0, reasons: [], agents: [] };
+    node.targetHeat = Math.max(0, Math.min(1, slot.heat));
+    node.runtimeReasons = slot.reasons.slice(0, 3);
+    node.runtimeAgents = slot.agents.slice(0, 3);
+  }
+
+  for (const job of jobNodes) {
+    const state = jobStateById[job.id] || { state: "queued", color: job.color || "#5eead4", detail: "idle" };
+    job.runtime_state = state.state;
+    job.runtime_state_color = state.color;
+    job.runtime_detail = state.detail;
+  }
+
+  const hotMemories = memoryNodes.filter((node) => (node.targetHeat || 0) >= 0.55).length;
+  return {
+    agents: activeAgents,
+    liveEdges,
+    aiUsage,
+    hotMemories,
+    runningJobs: Object.values(jobStateById).filter((item) => item.state === "running").length,
+    topTask: String(lastAction.command || task.phase || "idle").slice(0, 36) || "idle",
+    lastUpdate: stats.timestamp || "",
+  };
+}
+
+function applyLiveActivity(stats) {
+  lastActivity = deriveLiveActivity(stats);
+  const activeIds = new Set();
+  for (const agent of lastActivity.agents) {
+    activeIds.add(agent.id);
+    const runtimeNode = ensureRuntimeAgent(agent);
+    const related = agent.related_memories.map((id) => nodeMap[id]).filter(Boolean);
+    let targetX = 0;
+    let targetY = 0;
+    if (related.length) {
+      targetX = related.reduce((sum, node) => sum + node.x, 0) / related.length;
+      targetY = related.reduce((sum, node) => sum + node.y, 0) / related.length;
+      const angle = (Math.PI * 2 * (activeIds.size - 1)) / Math.max(1, lastActivity.agents.length);
+      targetX += Math.cos(angle) * 90;
+      targetY += Math.sin(angle) * 90;
+    } else {
+      const angle = (Math.PI * 2 * (activeIds.size - 1)) / Math.max(1, lastActivity.agents.length);
+      targetX = Math.cos(angle) * 120;
+      targetY = Math.sin(angle) * 120;
+    }
+    runtimeNode.targetX = targetX;
+    runtimeNode.targetY = targetY;
+  }
+  runtimeAgents = runtimeAgents.filter((agent) => {
+    if (activeIds.has(agent.id)) return true;
+    return performance.now() - agent.seenAt < 18000;
+  });
+  for (const id of Object.keys(runtimeAgentMap)) {
+    if (!runtimeAgents.includes(runtimeAgentMap[id])) delete runtimeAgentMap[id];
+  }
+  runtimeEdges = lastActivity.liveEdges;
+  runtimeOrbitals = [];
+  for (const agent of runtimeAgents) {
+    runtimeOrbitals.push(...buildAgentOrbitals(agent, lastActivity.aiUsage || {}));
+  }
+  document.getElementById("hud-active-agents").textContent = String(lastActivity.agents.length);
+  document.getElementById("hud-running-jobs").textContent = String(lastActivity.runningJobs);
+  document.getElementById("hud-hot-memories").textContent = String(lastActivity.hotMemories);
+  document.getElementById("hud-top-task").textContent = lastActivity.topTask || "idle";
+  document.getElementById("hud-last-update").textContent = formatTimeAgo(lastActivity.lastUpdate);
+  applySearch();
+  refreshInspectorCards();
+  updateInspector();
+}
+
+function pollLive() {
+  if (!API_TOKEN) {
+    document.getElementById("hud-last-update").textContent = "static";
+    return;
+  }
+  fetchJsonWithTimeout("/api/ai-map-activity", 7000)
+    .then((stats) => applyLiveActivity(stats))
+    .catch((err) => {
+      document.getElementById("hud-last-update").textContent = `error`;
+    })
+    .finally(() => {
+      window.setTimeout(pollLive, 3500);
+    });
+}
+
+function visibleNode(node) {
+  if (node.kind === "job" && !showJobs) return false;
+  if (node.kind === "runtime-agent" && !showAgents) return false;
+  if (node.kind === "agent-orbital" && !showAgents) return false;
+  return true;
+}
+
+function simulate() {
+  const refEdges = edges.filter((edge) => edge.kind === "reference");
+  for (const node of memoryNodes) {
+    if (node.fixed) continue;
+    let fx = -node.x * 0.0021;
+    let fy = -node.y * 0.0021;
+    for (const other of memoryNodes) {
+      if (node === other) continue;
+      const dx = node.x - other.x;
+      const dy = node.y - other.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) + 0.5;
+      const repel = 1700 / (dist * dist);
+      fx += (dx / dist) * repel;
+      fy += (dy / dist) * repel;
+    }
+    node.vx = (node.vx + fx) * 0.84;
+    node.vy = (node.vy + fy) * 0.84;
+  }
+  for (const edge of refEdges) {
+    const source = nodeMap[edge.source];
+    const target = nodeMap[edge.target];
+    if (!source || !target) continue;
+    const dx = target.x - source.x;
+    const dy = target.y - source.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) + 0.5;
+    const pull = (dist - 138) * 0.018;
+    const fx = (dx / dist) * pull;
+    const fy = (dy / dist) * pull;
+    if (!source.fixed) { source.vx += fx; source.vy += fy; }
+    if (!target.fixed) { target.vx -= fx; target.vy -= fy; }
+  }
+  for (const node of memoryNodes) {
+    if (!node.fixed) {
+      node.x += node.vx;
+      node.y += node.vy;
+    }
+    node.activityHeat += (node.targetHeat - node.activityHeat) * 0.08;
+  }
+  for (const agent of runtimeAgents) {
+    const dx = (agent.targetX || 0) - agent.x;
+    const dy = (agent.targetY || 0) - agent.y;
+    let fx = dx * 0.018;
+    let fy = dy * 0.018;
+    for (const other of runtimeAgents) {
+      if (other === agent) continue;
+      const ox = agent.x - other.x;
+      const oy = agent.y - other.y;
+      const dist = Math.sqrt(ox * ox + oy * oy) + 0.5;
+      const repel = 820 / (dist * dist);
+      fx += (ox / dist) * repel;
+      fy += (oy / dist) * repel;
+    }
+    agent.vx = (Number(agent.vx || 0) + fx) * 0.82;
+    agent.vy = (Number(agent.vy || 0) + fy) * 0.82;
+    if (!agent.fixed) {
+      agent.x += agent.vx;
+      agent.y += agent.vy;
+    }
+  }
+  syncRuntimeOrbitals(lastFrameTs || performance.now());
+}
+
+function baseMemoryColor(node) {
+  return node.sensitive ? "#ff6b6b" : (node.agent_related ? "#64dfff" : "#8fb7ff");
+}
+
+function jobStateColor(node) {
+  return node.runtime_state_color || node.color || "#5eead4";
+}
+
+function agentStatusColor(node) {
+  return node.status_color || "#22c55e";
+}
+
+function drawLabel(node, screen) {
+  const isJob = node.kind === "job";
+  const isAgent = node.kind === "runtime-agent";
+  const isOrbital = node.kind === "agent-orbital";
+  const radius = isOrbital ? orbitalRadius(node) : (isAgent ? agentRadius(node) : memoryRadius(node));
+  const show = isJob
+    || isAgent
+    || (isOrbital && (node.orbital_kind === "task" || node.orbital_kind === "tokens" || node.orbital_kind === "status" || node === selectedNode || node.searchMatch))
+    || node === selectedNode
+    || node.searchMatch
+    || radius >= 14;
+  if (!show) return;
+  ctx.save();
+  ctx.font = isJob ? "10px ui-monospace, SFMono-Regular, Menlo, monospace" : (isOrbital ? "10px ui-monospace, SFMono-Regular, Menlo, monospace" : "11px ui-monospace, SFMono-Regular, Menlo, monospace");
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = isJob ? "#f7fbff" : (isAgent ? "#f4fff7" : (isOrbital ? "#eff8ff" : "#d7e7ff"));
+  const text = compactLabel(String(node.label || node.file_name || ""), isJob ? 28 : (isOrbital ? 16 : 24));
+  const yOffset = isJob ? 0 : radius + (isOrbital ? 9 : 12);
+  ctx.fillText(text, screen.sx, screen.sy + yOffset);
+  ctx.restore();
+}
+
+function drawOrbitalLinks(time) {
+  runtimeOrbitals.forEach((orbital, index) => {
+    const parent = runtimeAgentMap[orbital.parent_id];
+    if (!parent || !visibleNode(parent) || !visibleNode(orbital)) return;
+    const sp = worldToScreen(parent.x, parent.y);
+    const tp = worldToScreen(orbital.x, orbital.y);
+    const pulse = 0.42 + 0.3 * Math.sin(time * 0.007 + index * 0.9);
+    ctx.save();
+    ctx.setLineDash(orbital.orbital_kind === "tokens" ? [6, 5] : []);
+    ctx.strokeStyle = orbital.color || "#7dd3fc";
+    ctx.globalAlpha = pulse;
+    ctx.lineWidth = orbital.orbital_kind === "task" ? 1.6 : 1.15;
+    ctx.beginPath();
+    ctx.moveTo(sp.sx, sp.sy);
+    ctx.lineTo(tp.sx, tp.sy);
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+function drawBaseEdges(time) {
+  for (const edge of edges) {
+    const source = nodeMap[edge.source];
+    const target = nodeMap[edge.target];
+    if (!source || !target || !visibleNode(source) || !visibleNode(target)) continue;
+    const sp = worldToScreen(source.x, source.y);
+    const tp = worldToScreen(target.x, target.y);
+    const activeHeat = Math.max(Number(source.activityHeat || 0), Number(target.activityHeat || 0));
+    ctx.save();
+    if (edge.kind === "job-read") {
+      ctx.setLineDash([7, 6]);
+      ctx.strokeStyle = activeHeat > 0.4 ? `rgba(255, 205, 96, ${0.42 + activeHeat * 0.35})` : "rgba(255, 200, 87, 0.28)";
+      ctx.lineWidth = activeHeat > 0.4 ? 1.8 : 1.05;
+    } else {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = activeHeat > 0.35
+        ? `rgba(129, 216, 255, ${0.18 + activeHeat * 0.28})`
+        : "rgba(110, 138, 170, 0.16)";
+      ctx.lineWidth = 1;
+    }
+    ctx.beginPath();
+    ctx.moveTo(sp.sx, sp.sy);
+    ctx.lineTo(tp.sx, tp.sy);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawRuntimeEdges(time) {
+  runtimeEdges.forEach((edge, index) => {
+    const source = edge.source.startsWith("agent_live_") ? runtimeAgentMap[edge.source] : nodeMap[edge.source];
+    const target = edge.target.startsWith("agent_live_") ? runtimeAgentMap[edge.target] : nodeMap[edge.target];
+    if (!source || !target || !visibleNode(source) || !visibleNode(target)) return;
+    const sp = worldToScreen(source.x, source.y);
+    const tp = worldToScreen(target.x, target.y);
+    const pulse = 0.45 + 0.35 * Math.sin(time * 0.006 + index * 0.8);
+    ctx.save();
+    ctx.setLineDash(edge.kind === "job-memory-live" ? [8, 6] : []);
+    ctx.strokeStyle = edge.color || "#ffc857";
+    ctx.globalAlpha = Math.min(1, (edge.intensity || 0.7) * pulse);
+    ctx.lineWidth = edge.kind === "agent-memory" ? 2.4 : 1.8;
+    ctx.beginPath();
+    ctx.moveTo(sp.sx, sp.sy);
+    const cx = (sp.sx + tp.sx) / 2;
+    const cy = (sp.sy + tp.sy) / 2 - (edge.kind === "agent-memory" ? 24 : 10);
+    ctx.quadraticCurveTo(cx, cy, tp.sx, tp.sy);
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+function drawNode(node, time) {
+  if (!visibleNode(node)) return;
+  const screen = worldToScreen(node.x, node.y);
+  if (node.kind === "job") {
+    const box = jobBox(node);
+    ctx.save();
+    ctx.fillStyle = jobStateColor(node);
+    ctx.globalAlpha = selectedNode && selectedNode.id === node.id ? 0.96 : 0.78;
+    ctx.shadowBlur = node.runtime_state === "running" ? 18 : 10;
+    ctx.shadowColor = jobStateColor(node);
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(screen.sx - box.w / 2, screen.sy - box.h / 2, box.w, box.h, 7);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  } else if (node.kind === "runtime-agent") {
+    const radius = agentRadius(node);
+    const pulse = 0.8 + 0.16 * Math.sin(time * 0.008 + radius);
+    ctx.save();
+    ctx.strokeStyle = agentStatusColor(node);
+    ctx.shadowBlur = 24;
+    ctx.shadowColor = agentStatusColor(node);
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.arc(screen.sx, screen.sy, radius * pulse, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+    ctx.save();
+    ctx.fillStyle = agentStatusColor(node);
+    ctx.globalAlpha = 0.94;
+    ctx.beginPath();
+    ctx.arc(screen.sx, screen.sy, radius * 0.72, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    if (node.progress_pct != null) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(screen.sx, screen.sy, radius + 4, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.max(0, Math.min(100, node.progress_pct)) / 100));
+      ctx.stroke();
+      ctx.restore();
+    }
+  } else if (node.kind === "agent-orbital") {
+    const radius = orbitalRadius(node);
+    const pulse = 0.86 + 0.18 * Math.sin(time * 0.01 + radius + String(node.id).length);
+    ctx.save();
+    ctx.fillStyle = node.color || "#7dd3fc";
+    ctx.globalAlpha = node.searchMatch ? 1 : 0.92;
+    ctx.shadowBlur = node.orbital_kind === "tokens" ? 22 : 14;
+    ctx.shadowColor = node.color || "#7dd3fc";
+    ctx.beginPath();
+    ctx.arc(screen.sx, screen.sy, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    if (node.orbital_kind === "tokens" || node.orbital_kind === "status") {
+      ctx.save();
+      ctx.strokeStyle = `rgba(255,255,255,${node.orbital_kind === "tokens" ? 0.9 : 0.55})`;
+      ctx.lineWidth = node.orbital_kind === "tokens" ? 1.5 : 1.2;
+      ctx.beginPath();
+      ctx.arc(screen.sx, screen.sy, radius + 4 * pulse, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  } else {
+    const radius = memoryRadius(node);
+    const heat = Number(node.activityHeat || 0);
+    ctx.save();
+    ctx.fillStyle = baseMemoryColor(node);
+    ctx.shadowBlur = 18 + heat * 28;
+    ctx.shadowColor = heat > 0.15 ? "#f97316" : baseMemoryColor(node);
+    ctx.globalAlpha = node.searchMatch ? 1 : 0.9;
+    ctx.beginPath();
+    ctx.arc(screen.sx, screen.sy, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    if (heat > 0.08) {
+      ctx.save();
+      ctx.strokeStyle = `rgba(249, 115, 22, ${0.16 + heat * 0.56})`;
+      ctx.lineWidth = 1.2 + heat * 1.4;
+      ctx.beginPath();
+      ctx.arc(screen.sx, screen.sy, radius + 5 + heat * 8, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+  drawLabel(node, screen);
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(W() * dpr);
+  canvas.height = Math.floor(H() * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W(), H());
+  const now = performance.now();
+  syncRuntimeOrbitals(now);
+  drawBaseEdges(now);
+  drawRuntimeEdges(now);
+  drawOrbitalLinks(now);
+  nodes.forEach((node) => drawNode(node, now));
+  runtimeAgents.forEach((node) => drawNode(node, now));
+  runtimeOrbitals.forEach((node) => drawNode(node, now));
+}
+
+function hitNode(wx, wy) {
+  for (let index = runtimeOrbitals.length - 1; index >= 0; index -= 1) {
+    const node = runtimeOrbitals[index];
+    if (!visibleNode(node)) continue;
+    const radius = orbitalRadius(node);
+    const dx = wx - node.x;
+    const dy = wy - node.y;
+    if (dx * dx + dy * dy <= radius * radius) return node;
+  }
+  for (let index = runtimeAgents.length - 1; index >= 0; index -= 1) {
+    const node = runtimeAgents[index];
+    if (!visibleNode(node)) continue;
+    const radius = agentRadius(node);
+    const dx = wx - node.x;
+    const dy = wy - node.y;
+    if (dx * dx + dy * dy <= radius * radius) return node;
+  }
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index];
+    if (!visibleNode(node)) continue;
+    if (node.kind === "job") {
+      const box = jobBox(node);
+      if (wx >= node.x - box.w / 2 && wx <= node.x + box.w / 2 && wy >= node.y - box.h / 2 && wy <= node.y + box.h / 2) return node;
+    } else {
+      const radius = memoryRadius(node);
+      const dx = wx - node.x;
+      const dy = wy - node.y;
+      if (dx * dx + dy * dy <= radius * radius) return node;
+    }
+  }
+  return null;
+}
+
+canvas.addEventListener("mousedown", (event) => {
+  pointerDown = true;
+  pointerTravel = 0;
+  dragStart = { x: event.clientX, y: event.clientY };
+  const world = screenToWorld(event.clientX, event.clientY);
+  const hit = hitNode(world.wx, world.wy);
+  draggedNode = hit && hit.kind === "agent-orbital" ? (runtimeAgentMap[hit.parent_id] || null) : hit;
+  if (draggedNode) {
+    dragMode = "node";
+    draggedNode.fixed = true;
+  } else {
+    dragMode = "pan";
+  }
+  canvas.classList.add("dragging");
+});
+
+window.addEventListener("mousemove", (event) => {
+  if (!pointerDown) return;
+  const dx = event.clientX - dragStart.x;
+  const dy = event.clientY - dragStart.y;
+  pointerTravel += Math.abs(dx) + Math.abs(dy);
+  dragStart = { x: event.clientX, y: event.clientY };
+  if (dragMode === "node" && draggedNode) {
+    const world = screenToWorld(event.clientX, event.clientY);
+    draggedNode.x = world.wx;
+    draggedNode.y = world.wy;
+  } else if (dragMode === "pan") {
+    camX -= dx / camZoom;
+    camY -= dy / camZoom;
+  }
+});
+
+window.addEventListener("mouseup", (event) => {
+  if (pointerDown && pointerTravel < 5) {
+    const world = screenToWorld(event.clientX, event.clientY);
+    const hit = hitNode(world.wx, world.wy);
+    if (hit) {
+      selectedNode = hit;
+      updateInspector();
+    }
+  }
+  pointerDown = false;
+  dragMode = null;
+  draggedNode = null;
+  canvas.classList.remove("dragging");
+});
+
+let inspectorDrag = null;
+
+document.addEventListener("mousedown", (event) => {
+  const closeBtn = event.target.closest("[data-inspector-close]");
+  if (closeBtn) {
+    event.preventDefault();
+    closeInspector(closeBtn.getAttribute("data-inspector-close"));
+    return;
+  }
+  const handle = event.target.closest("[data-inspector-drag]");
+  if (!handle) return;
+  const panel = document.getElementById(handle.getAttribute("data-inspector-drag"));
+  if (!panel) return;
+  const rect = panel.getBoundingClientRect();
+  panel.style.left = rect.left + "px";
+  panel.style.top = rect.top + "px";
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+  inspectorDrag = {
+    panel,
+    dx: event.clientX - rect.left,
+    dy: event.clientY - rect.top,
+  };
+  bringInspectorToFront(panel);
+  event.preventDefault();
+});
+
+document.addEventListener("mousemove", (event) => {
+  if (!inspectorDrag) return;
+  inspectorDrag.panel.style.left = (event.clientX - inspectorDrag.dx) + "px";
+  inspectorDrag.panel.style.top = (event.clientY - inspectorDrag.dy) + "px";
+});
+
+document.addEventListener("mouseup", () => {
+  inspectorDrag = null;
+});
+
+canvas.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  const factor = event.deltaY > 0 ? 0.9 : 1.1;
+  camZoom = Math.max(0.15, Math.min(4, camZoom * factor));
+}, { passive: false });
+
+searchInput.addEventListener("input", applySearch);
+
+window.addEventListener("message", (event) => {
+  if (event.origin !== window.location.origin) return;
+  const data = event.data || {};
+  if (data.type !== "parad0x-ai-map-search") return;
+  searchInput.value = String(data.query || "");
+  applySearch();
+});
+
+function resetView() {
+  camX = 0;
+  camY = 0;
+  camZoom = 1;
+}
+
+function reLayout() {
+  initPositions();
+}
+
+function toggleJobs() {
+  showJobs = !showJobs;
+}
+
+function toggleAgents() {
+  showAgents = !showAgents;
+}
+
+function frame(ts) {
+  lastFrameTs = ts || performance.now();
+  simulate();
+  draw();
+  requestAnimationFrame(frame);
+}
+
+frame();
+applySearch();
+if (initialActivity) {
+  applyLiveActivity(initialActivity);
+}
+pollLive();
+</script>
+</body>
+</html>"""
+    return (
+        template
+        .replace("__TITLE__", html.escape(title))
+        .replace("__GRAPH_JSON__", json.dumps(graph))
+        .replace("__API_TOKEN_JSON__", json.dumps(api_token))
+        .replace("__INITIAL_ACTIVITY_JSON__", json.dumps(initial_activity or {}))
+    )
 
 
 def _render_galactic_html(graph: Dict[str, Any], title: str) -> str:
@@ -2226,6 +4179,64 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print("  Ctrl+C to stop")
 
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return 0
+
+
+def cmd_memory_map(args: argparse.Namespace) -> int:
+    target = Path(args.path).expanduser().resolve()
+    if not target.is_dir():
+        if getattr(args, "json", False):
+            _emit("memory-map", False, {"error": f"Not a directory: {target}"})
+        else:
+            print(f"ERROR: not a directory: {target}", file=sys.stderr)
+        return 1
+
+    graph = _build_memory_map(target, max_files=args.max_files, max_depth=args.max_depth)
+    title = f"Memory Map v2 — {target.name}"
+    html_content = _render_memory_map_html(graph, title)
+
+    if getattr(args, "out", None):
+        out = Path(args.out).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(html_content, encoding="utf-8")
+
+    if getattr(args, "json", False):
+        _emit(
+            "memory-map",
+            True,
+            {
+                "html_path": str(args.out) if getattr(args, "out", None) else None,
+                "stats": graph["stats"],
+            },
+        )
+        return 0
+
+    port = args.port
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(html_content.encode("utf-8"))
+
+        def log_message(self, fmt, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"Memory Map v2 live at {url}")
+    print(f"  {graph['stats']['total_memories']} memories | {graph['stats']['total_jobs']} jobs")
+    print("  Ctrl+C to stop")
+
+    if not getattr(args, "no_browser", False):
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
 
     try:
         server.serve_forever()
@@ -3890,12 +5901,19 @@ def _gather_system_snapshot(target: Path, workspace: Optional[Path] = None) -> D
     }
 
 
-def _render_live_html(system_data: Dict[str, Any], file_graph: Dict[str, Any], title: str, api_token: str = "") -> str:
+def _render_live_html(
+    system_data: Dict[str, Any],
+    file_graph: Dict[str, Any],
+    title: str,
+    api_token: str = "",
+    memory_map_url: str = "",
+) -> str:
     sys_json = json.dumps(system_data)
     file_json = json.dumps(file_graph)
     cat_colors_json = json.dumps(CATEGORY_COLORS)
     type_colors_json = json.dumps(TYPE_COLORS)
     api_token_json = json.dumps(api_token)
+    memory_map_url_json = json.dumps(memory_map_url)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -4034,6 +6052,18 @@ def _render_live_html(system_data: Dict[str, Any], file_graph: Dict[str, Any], t
     position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 11;
     display: flex; align-items: center; gap: 10px; max-width: min(92vw, 980px);
   }}
+  #view-switch {{
+    display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  }}
+  #view-switch button {{
+    background: rgba(5,5,18,0.92); border: 1px solid rgba(100,220,255,0.15);
+    color: #94a9be; padding: 6px 10px; border-radius: 999px; cursor: pointer;
+    font-size: 10px; font-family: inherit; letter-spacing: 0.45px; font-weight: 700;
+  }}
+  #view-switch button:hover {{ color:#dbeafe; border-color: rgba(0,255,200,0.25); }}
+  #view-switch button.active {{
+    color: #00ffcc; border-color: rgba(0,255,200,0.35); box-shadow: 0 0 14px rgba(0,255,200,0.08);
+  }}
   #search {{
     position: relative; flex: 0 0 auto;
   }}
@@ -4057,6 +6087,24 @@ def _render_live_html(system_data: Dict[str, Any], file_graph: Dict[str, Any], t
   }}
   .dock-pill:hover {{ color:#dbeafe; border-color: rgba(0,255,200,0.3); }}
   #btn-restore-panels {{ display:none; }}
+  #memory-map-shell {{
+    position: fixed; inset: 0; z-index: 9; display: none;
+    background: transparent; border: 0; border-radius: 0; overflow: hidden; box-shadow: none;
+  }}
+  #memory-map-frame {{
+    width: 100%; height: 100%; border: 0; display: block; background: transparent;
+  }}
+  body.view-ai-map #memory-map-shell {{ display: block; }}
+  body.view-ai-map #galaxy,
+  body.view-ai-map #hud,
+  body.view-ai-map #legend,
+  body.view-ai-map #controls,
+  body.view-ai-map .surface-card,
+  body.view-ai-map #inspector-layer,
+  body.view-ai-map #node-menu,
+  body.view-ai-map #alarm-overlay {{
+    display: none !important;
+  }}
 
   .surface-card {{
     position: fixed; z-index: 12;
@@ -4252,6 +6300,10 @@ def _render_live_html(system_data: Dict[str, Any], file_graph: Dict[str, Any], t
 </div>
 
 <div id="top-center">
+  <div id="view-switch">
+    <button id="view-system-btn" class="active" onclick="setMainView('system')">SYSTEM</button>
+    <button id="view-ai-map-btn" onclick="setMainView('ai-map')">AI MAP</button>
+  </div>
   <div id="search"><input type="text" placeholder="Search system..." id="search-input"></div>
   <div id="panel-dock"></div>
 </div>
@@ -4373,11 +6425,13 @@ def _render_live_html(system_data: Dict[str, Any], file_graph: Dict[str, Any], t
 
 <div id="node-menu"></div>
 <div id="alarm-overlay"></div>
+<div id="memory-map-shell"><iframe id="memory-map-frame" title="AI Map"></iframe></div>
 
 <canvas id="galaxy"></canvas>
 
 <script>
 const API_TOKEN = {api_token_json};
+const MEMORY_MAP_URL = {memory_map_url_json};
 const sysData = {sys_json};
 const fileGraph = {file_json};
 const CAT_COLORS = {cat_colors_json};
@@ -4395,8 +6449,10 @@ const opsContent = document.getElementById("ops-content");
 const nodeMenu = document.getElementById("node-menu");
 const alarmOverlay = document.getElementById("alarm-overlay");
 const threatPanelEl = document.getElementById("threat-panel");
+const memoryMapFrame = document.getElementById("memory-map-frame");
 const pendingActionKeys = new Set();
 const pendingPanicActions = new Set();
+let mainView = "system";
 
 // --- Build unified node/edge model ---
 const allNodes = [];
@@ -7021,6 +9077,10 @@ function reLayout() {{
 }}
 
 document.getElementById("search-input").addEventListener("input", e => {{
+  if (mainView === "ai-map") {{
+    syncMainSearchToAiMap();
+    return;
+  }}
   const q = e.target.value.toLowerCase().trim();
   allNodes.forEach(n => {{
     n.searchMatch = q.length > 0 && ((n.label||'').toLowerCase().includes(q) || (n.path||'').toLowerCase().includes(q) || (n.detail||'').toLowerCase().includes(q) || (n.category||'').toLowerCase().includes(q));
@@ -7174,6 +9234,56 @@ const panelTitles = {{
   "ops": "Ops",
   "guide": "Guide",
 }};
+
+function updateMainViewButtons() {{
+  const systemBtn = document.getElementById("view-system-btn");
+  const aiBtn = document.getElementById("view-ai-map-btn");
+  if (systemBtn) systemBtn.classList.toggle("active", mainView === "system");
+  if (aiBtn) aiBtn.classList.toggle("active", mainView === "ai-map");
+}}
+
+function syncMainSearchToAiMap() {{
+  const input = document.getElementById("search-input");
+  if (mainView !== "ai-map" || !memoryMapFrame || !memoryMapFrame.contentWindow || !input) return;
+  memoryMapFrame.contentWindow.postMessage({{
+    type: "parad0x-ai-map-search",
+    query: input.value || "",
+  }}, window.location.origin);
+}}
+
+function updateMainSearchPlaceholder() {{
+  const input = document.getElementById("search-input");
+  if (!input) return;
+  input.placeholder = mainView === "ai-map" ? "Search AI map..." : "Search system...";
+}}
+
+function setMainView(mode) {{
+  mainView = mode === "ai-map" ? "ai-map" : "system";
+  document.body.classList.toggle("view-ai-map", mainView === "ai-map");
+  if (mainView === "ai-map" && memoryMapFrame && MEMORY_MAP_URL && !memoryMapFrame.src) {{
+    memoryMapFrame.src = MEMORY_MAP_URL;
+  }}
+  syncMainSearchToAiMap();
+  updateMainSearchPlaceholder();
+  updateMainViewButtons();
+  try {{
+    localStorage.setItem("parad0x_command_main_view", mainView);
+  }} catch (e) {{}}
+}}
+
+function loadMainView() {{
+  let saved = "system";
+  try {{
+    saved = localStorage.getItem("parad0x_command_main_view") || "system";
+  }} catch (e) {{}}
+  setMainView(saved);
+}}
+
+if (memoryMapFrame) {{
+  memoryMapFrame.addEventListener("load", () => {{
+    syncMainSearchToAiMap();
+  }});
+}}
 
 function renderPanelDock() {{
   const dock = document.getElementById("panel-dock");
@@ -7334,6 +9444,7 @@ document.addEventListener("mouseup", e => {{
 setInterval(saveLayout, 15000);
 window.addEventListener("beforeunload", saveLayout);
 loadLayout();
+loadMainView();
 recomputeAppOrbit(sysData.processes || []);
 
 simulate();
@@ -7433,7 +9544,34 @@ def cmd_live(args: argparse.Namespace) -> int:
 
     title = "Parad0x Command"
     api_token = secrets.token_urlsafe(24)
-    html_content = _render_live_html(sys_snapshot, file_graph, title, api_token=api_token)
+    memory_map_root = workspace or target
+    print(f"Building AI map from {memory_map_root}...")
+    memory_map_graph = _build_memory_map(memory_map_root, max_files=args.max_files, max_depth=args.max_depth)
+    print(
+        f"  {memory_map_graph['stats']['total_memories']} memories, "
+        f"{memory_map_graph['stats']['total_jobs']} jobs"
+    )
+    ai_map_activity = {
+        "timestamp": sys_snapshot.get("timestamp"),
+        "processes": sys_snapshot.get("processes", []),
+        "task_progress": sys_snapshot.get("task_progress", {}),
+        "activity_feed": sys_snapshot.get("activity_feed", []),
+        "threat": sys_snapshot.get("threat", {}),
+    }
+    memory_map_html = _render_memory_map_html(
+        memory_map_graph,
+        f"AI Activity Map — {memory_map_root.name}",
+        api_token=api_token,
+        initial_activity=ai_map_activity,
+    )
+    memory_map_url = f"/memory-map-view?token={urllib.parse.quote(api_token, safe='')}"
+    html_content = _render_live_html(
+        sys_snapshot,
+        file_graph,
+        title,
+        api_token=api_token,
+        memory_map_url=memory_map_url,
+    )
 
     port = args.port
 
@@ -7458,6 +9596,27 @@ def cmd_live(args: argparse.Namespace) -> int:
                 data["task_progress"] = _build_task_progress_summary(history)
                 data["activity_feed"] = _build_activity_feed(history, data.get("monitor_rows", []), data["threat"])
                 _send_json_response(self, 200, data)
+            elif req_path == "/api/ai-map-activity":
+                if not self._require_api_auth():
+                    return
+                data = _build_ai_map_activity_snapshot(
+                    file_graph,
+                    workspace,
+                    cached_ai_usage=sys_snapshot.get("ai_usage", {}),
+                    cached_net_type=str((sys_snapshot.get("hardware") or [{}])[-1].get("label", "Disconnected")),
+                )
+                _send_json_response(self, 200, data)
+            elif req_path == "/memory-map-view":
+                params = urllib.parse.parse_qs(req.query)
+                req_token = str(params.get("token", [""])[0] or "")
+                if req_token != api_token:
+                    _send_json_response(self, 403, {"ok": False, "error": "Forbidden"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(memory_map_html.encode("utf-8"))
             elif req_path.startswith("/api/"):
                 _send_json_response(self, 405, {"ok": False, "error": "POST required"})
             else:
@@ -8782,6 +10941,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--max-files", type=int, default=MAX_FILES)
     p_serve.add_argument("--max-depth", type=int, default=MAX_DEPTH)
     p_serve.set_defaults(fn=cmd_serve)
+
+    p_memory = sub.add_parser("memory-map", help="V2 memory graph — markdown memories + scheduled jobs")
+    p_memory.add_argument("path", help="Root directory to scan for markdown memories")
+    p_memory.add_argument("--port", type=int, default=8766)
+    p_memory.add_argument("--max-files", type=int, default=MAX_FILES)
+    p_memory.add_argument("--max-depth", type=int, default=MAX_DEPTH)
+    p_memory.add_argument("--out", help="Optional output HTML path")
+    p_memory.add_argument("--json", action="store_true", help="Build the memory map without launching the server")
+    p_memory.add_argument("--no-browser", action="store_true", help="Serve without opening a browser tab")
+    p_memory.set_defaults(fn=cmd_memory_map)
 
     p_live = sub.add_parser("live", help="Full system organism — hardware + processes + files, live updating")
     p_live.add_argument("path", help="Root directory to visualize")
