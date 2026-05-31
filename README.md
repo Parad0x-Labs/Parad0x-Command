@@ -1,26 +1,179 @@
-# Parad0x-Command
+# Parad0x Command
 
-Local desktop command center for agents and systems.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Mode: Local First](https://img.shields.io/badge/Mode-Local--First-0b0f1a) ![Access: 127.0.0.1](https://img.shields.io/badge/Access-127.0.0.1-blue) ![Platforms: macOS Windows Linux](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-111827)
 
-Live graph of apps, processes, browser, files, agents, telemetry. SYSTEM and AI MAP views. No cloud dependency.
+Local-first desktop command center for apps, processes, browser activity, files, agents, and system telemetry.
 
-### How this fits the Parad0x stack
+Owner: `Parad0x Labs`  
+Contributor: `@sls_0x`  
+License: `MIT` (see `LICENSE`)
 
-Parad0x Labs builds Web0 on Solana — money and agents that settle themselves. **You are here: 🖥️ Command.**
+## What You Get
 
-| Layer | Repo | Does |
-|---|---|---|
-| 💸 Payments | [dna-x402](https://github.com/Parad0x-Labs/dna-x402) | x402 rail: quote → pay → verify → receipt → anchor |
-| 🛠️ Build | [dna-x402-builders](https://github.com/Parad0x-Labs/dna-x402-builders) | Hosted kit: turn any API/bot into a paid agent |
-| 🕶️ Privacy | [Dark-Null-Protocol](https://github.com/Parad0x-Labs/Dark-Null-Protocol) | Groth16 privacy settlement, published proofs |
-| 🗜️ Data | [liquefy](https://github.com/Parad0x-Labs/liquefy) | Columnar compression that beats Zstd + audit trails |
-| 🎬 Media | [nebula-media](https://github.com/Parad0x-Labs/nebula-media) | Perceptual video re-encoding, VMAF quality proofs |
-| 🧠 Local AI | [nulla-local](https://github.com/Parad0x-Labs/nulla-local) | Local-first agent runtime — your machine, your memory |
+- Live system graph with apps, processes, files, hardware, and browser activity.
+- `SYSTEM` view for operational control and `AI MAP` view for live agent activity.
+- Multiple draggable inspector cards for side-by-side comparison.
+- Local process controls and network cut/restore controls.
+- No cloud dependency; local-only by default.
 
-**See it live**: [parad0xlabs.com](https://parad0xlabs.com)
+## Quick Start
 
----
+### One-command setup from GitHub
 
-See the full documentation in this repository.
+**macOS / Linux**
 
-**License:** MIT — © 2026 Parad0x Labs
+```bash
+git clone https://github.com/Parad0x-Labs/Parad0x-Command.git && cd Parad0x-Command && bash ./setup.sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/Parad0x-Labs/Parad0x-Command.git; Set-Location .\Parad0x-Command; .\setup.ps1
+```
+
+**Windows (CMD)**
+
+```cmd
+git clone https://github.com/Parad0x-Labs/Parad0x-Command.git && cd Parad0x-Command && setup.bat
+```
+
+### Setup from an extracted folder
+
+```bash
+bash ./setup.sh
+```
+
+```powershell
+.\setup.ps1
+```
+
+```cmd
+setup.bat
+```
+
+## Launch
+
+### Preferred launchers
+
+```text
+Start Parad0x Command on Windows.cmd
+Start Parad0x Command on Linux.sh
+Start Parad0x Command on macOS.command
+```
+
+### Direct terminal launch
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_parad0x_command_export.ps1
+```
+
+```bash
+bash ./run_parad0x_command_export.sh
+```
+
+### Direct CLI
+
+Live browser UI:
+
+```bash
+./parad0x-command live . --workspace . --desktop --port 8776
+```
+
+Native window mode:
+
+```bash
+./parad0x-command native . --workspace . --desktop --port 8774
+```
+
+## V2: AI MAP
+
+AI MAP turns the system view into a live agent activity map:
+
+- Agent nodes with orbiting task, token, process, and status signals.
+- Memory files glow when active or referenced.
+- Live edges pulse on recent activity.
+- Multiple inspector cards for comparison.
+- The AI MAP uses the same local data plane as SYSTEM, not a separate remote service.
+
+## SDK / Agent Integration
+
+Parad0x Command is local-first but still automation friendly:
+
+- Local HTTP API over `127.0.0.1` with per-run token auth.
+- JSON responses for system and AI activity snapshots.
+- For agent-facing usage, see `AGENTS.md`.
+
+## Security Model
+
+Parad0x Command is local-first and includes explicit protections around its localhost control surface.
+
+- The server binds to `127.0.0.1` only.
+- Each run generates a random in-memory API token.
+- `/api/*` requests must present that token.
+- Dangerous actions require authenticated `POST`, not unauthenticated `GET`.
+- Loopback `Host` plus origin or referrer checks are enforced where relevant.
+- Wildcard CORS was removed, so normal websites cannot read local stats from the running session.
+
+Practical meaning:
+
+- Other machines cannot directly reach it over the network in the default setup.
+- The local control surface is substantially more resistant to unauthorized browser-triggered requests than a raw unauthenticated localhost panel.
+- It is a local desktop tool, not a multi-user remote control server.
+
+## Platform Notes
+
+Browser visibility is platform-dependent:
+
+- macOS Safari provides the strongest live tab visibility.
+- Windows Chrome or Edge work best when the browser exposes a Chromium debug endpoint.
+- Linux works best on a full desktop session with accessible browser or X11 session data.
+- Linux VM, VNC, stripped desktop, or locked-down Wayland sessions can expose much less metadata.
+
+If Chrome or Edge needs stronger tab visibility on Windows or Linux, launch the browser with:
+
+```text
+--remote-debugging-port=9222
+```
+
+Windows and Linux can fall back to browser window titles when true per-tab metadata is unavailable.
+
+## Operational Notes
+
+- Multiple inspector cards can remain open at the same time.
+- Wi-Fi cut on Windows prefers WLAN disconnect.
+- Wi-Fi restore on Windows prefers reconnecting the previously used Wi-Fi profile.
+- Adapter disable or enable is only a fallback path.
+
+## Resource Snapshot
+
+Observed on an active Safari tab during testing:
+
+- Traffic pulse: `100%`
+- Safari CPU share: `41.9%`
+- Approx CPU load: `0.42 / 10 core-equiv`
+- Safari memory share: `0.8%`
+- Approx Safari RAM: `196.6 MB`
+
+These values depend on the active tab and all other foreground or background processes. They can be lower or much higher in real use.
+
+Share values are estimated from the current Safari family load, not total machine usage.
+
+## Included Launchers
+
+- `Start Parad0x Command on Windows.cmd`
+- `Start Parad0x Command on Linux.sh`
+- `Start Parad0x Command on macOS.command`
+- `run_parad0x_command_export.ps1`
+- `run_parad0x_command_export.sh`
+- `parad0x-command`
+
+## Repository
+
+Product name:
+
+- `Parad0x Command`
+
+GitHub repository slug:
+
+- `Parad0x-Command`
