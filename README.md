@@ -181,3 +181,7 @@ Product name:
 GitHub repository slug:
 
 - `Parad0x-Command`
+
+<p align="center">
+  <img src="./docs/assets/github-footer-parad0xlabs.png" alt="NULL - Parad0xLabs open source systems" width="100%" />
+</p>
