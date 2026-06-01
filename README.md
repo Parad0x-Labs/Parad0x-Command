@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./docs/assets/github-header-parad0x-command.png" alt="Parad0x Command - Local-first desktop command center" width="100%" />
+</p>
+
 # Parad0x Command
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE) ![Mode: Local First](https://img.shields.io/badge/Mode-Local--First-0b0f1a) ![Access: 127.0.0.1](https://img.shields.io/badge/Access-127.0.0.1-blue) ![Platforms: macOS Windows Linux](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-111827)
@@ -177,3 +181,7 @@ Product name:
 GitHub repository slug:
 
 - `Parad0x-Command`
+
+<p align="center">
+  <img src="./docs/assets/github-footer-parad0xlabs.png" alt="NULL - Parad0xLabs open source systems" width="100%" />
+</p>
